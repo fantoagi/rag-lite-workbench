@@ -1,0 +1,18 @@
+# RAG-Lite MVP: local Ollama LLM + embeddings. Python 3.10-3.12 recommended on Windows.
+# Avoid 3.14+ (Pillow/torch wheels). Gradio 6 is heavy; we pin 5.50 (works with huggingface-hub 1.x + transformers 5).
+# Gradio 4.44 needs HfFolder removed in hub 1.x -- incompatible with transformers 5; use Gradio 5.50+.
+gradio==5.50.0
+gradio-client==1.14.0
+tomlkit>=0.12.0,<0.14.0
+pydantic>=2.0,<=2.12.3
+typing-extensions>=4.8.0
+llama-index-core>=0.11.0
+llama-index-vector-stores-chroma>=0.3.0
+llama-index-llms-ollama>=0.3.0
+llama-index-embeddings-ollama>=0.4.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+torch>=2.1.0
+pypdf>=4.0.0
+python-docx>=1.0.0
+pyyaml>=6.0

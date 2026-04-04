@@ -1,0 +1,45 @@
+# Paths relative to project root (ragZone/) unless absolute.
+data_dir: ./data
+uploads_subdir: uploads
+chroma_subdir: chroma
+sqlite_filename: rag_lite.db
+collection_name: rag_lite
+
+ollama:
+  base_url: http://127.0.0.1:11434
+  # 默认模型；界面下拉会与 Ollama /api/tags 合并，并记住上次选择（data/ui_preferences.json）
+  llm_model: qwen2.5:0.5b
+  embed_model: bge-m3
+  # 可选：预置多候选名（与 ollama 列表合并，便于对比实验）
+  # llm_models:
+  #   - qwen2.5:7b
+  # embed_models:
+  #   - bge-m3
+  request_timeout: 120.0
+
+ingest:
+  max_file_size_mb: 50
+
+rerank:
+  enabled_default: false
+  model_name: BAAI/bge-reranker-v2-m3
+  device: null
+
+retrieval:
+  top_n_default: 20
+  top_k_default: 3
+
+chunking:
+  chunk_size_default: 512
+  chunk_overlap_default: 64
+
+prompt:
+  version: "v1"
+  system_default: |
+    你是一个严谨的助手。请仅根据下面「已知上下文」回答问题；若上下文没有相关信息，请明确说「根据已知材料无法回答」，不要编造。
+
+ui:
+  server_name: 127.0.0.1
+  server_port: 7860
+  share: false
+  open_browser: true
