@@ -673,6 +673,12 @@ _SOURCES_EMPTY_HTML = (
     "</div>"
 )
 
+_DIAG_EMPTY_HTML = (
+    '<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:0;">'
+    '<p style="margin:0;color:#64748b;">发送问题后，这里会展示本轮的检索诊断：Top-N 候选、最终送入上下文的 Top-K、是否发生重排，以及用于效果排查的摘要。</p>'
+    "</div>"
+)
+
 # 页头：「!」+ checkbox；浮层 fixed，位置由 launch(head) 注入的 rag_tip_popover.js 算在按钮右侧
 _RAG_HEADER_HTML = """
 <div class="rag-workbench-header">
@@ -932,6 +938,185 @@ def _sources_panel_html(sources: list) -> str:
     )
 
 
+def _compact_diag_sources(rows: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for i, s in enumerate(rows[: max(1, int(limit))], start=1):
+        out.append(
+            {
+                "rank": i,
+                "file_name": str(s.get("file_name") or "unknown"),
+                "score": s.get("score"),
+                "score_kind": str(s.get("score_kind") or ""),
+                "vector_score": s.get("vector_score"),
+                "preview": _preview_chunk_text(str(s.get("chunk") or ""), 220),
+            }
+        )
+    return out
+
+
+def _retrieval_diag_payload(
+    *,
+    query: str,
+    vector_candidates: list[dict[str, Any]],
+    final_sources: list[dict[str, Any]],
+    top_n: int,
+    top_k: int,
+    use_rerank: bool,
+    score_kind: str,
+) -> dict[str, Any]:
+    before_names = [str(x.get("file_name") or "") for x in vector_candidates[: max(1, min(top_k, len(vector_candidates)))]]
+    after_names = [str(x.get("file_name") or "") for x in final_sources]
+    return {
+        "query": query,
+        "top_n": int(top_n),
+        "top_k": int(top_k),
+        "use_rerank": bool(use_rerank),
+        "score_kind": score_kind,
+        "candidate_count": len(vector_candidates),
+        "final_count": len(final_sources),
+        "rerank_changed_order": before_names != after_names if bool(use_rerank) else False,
+        "vector_candidates": _compact_diag_sources(vector_candidates, limit=20),
+        "final_contexts": _compact_diag_sources(final_sources, limit=12),
+    }
+
+
+def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
+    if not diag:
+        return _DIAG_EMPTY_HTML
+    cand = list(diag.get("vector_candidates") or [])
+    finals = list(diag.get("final_contexts") or [])
+    use_rerank = bool(diag.get("use_rerank"))
+    score_kind = str(diag.get("score_kind") or "vector")
+    summary = (
+        f'<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:8px;">'
+        f'<p style="margin:0;"><strong>候选数：</strong>{int(diag.get("candidate_count") or 0)}'
+        f'　<strong>送入上下文：</strong>{int(diag.get("final_count") or 0)}'
+        f'　<strong>重排：</strong>{"开启" if use_rerank else "关闭"}'
+        f'　<strong>顺序变化：</strong>{"是" if diag.get("rerank_changed_order") else "否"}</p>'
+        f"</div>"
+    )
+
+    def _table(title: str, rows: list[dict[str, Any]], show_vector: bool) -> str:
+        if not rows:
+            return f'<p style="margin:0 0 8px 0;color:#64748b;">{html.escape(title)}：无数据。</p>'
+        body: list[str] = []
+        for row in rows:
+            rank = int(row.get("rank") or 0)
+            fname = html.escape(str(row.get("file_name") or "unknown"))
+            score = row.get("score")
+            score_s = "—" if score is None else f"{float(score):.4f}"
+            extras = ""
+            if show_vector:
+                vec = row.get("vector_score")
+                vec_s = "—" if vec is None else f"{float(vec):.4f}"
+                extras = f" / 向量 {vec_s}"
+            preview = html.escape(str(row.get("preview") or ""))
+            body.append(
+                "<tr>"
+                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{rank}</td>"
+                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{fname}</td>"
+                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;white-space:nowrap;'>{score_s}{extras}</td>"
+                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{preview}</td>"
+                "</tr>"
+            )
+        return (
+            f"<details open style='margin-top:8px;border:1px solid #e5e7eb;border-radius:8px;background:#fff;'>"
+            f"<summary style='padding:8px 12px;cursor:pointer;font-weight:600;color:#334155;'>{html.escape(title)}</summary>"
+            "<div style='padding:0 8px 8px 8px;overflow-x:auto;'>"
+            "<table style='width:100%;border-collapse:collapse;font-size:0.88em;'>"
+            "<thead><tr>"
+            "<th style='text-align:left;padding:6px 8px;'>#</th>"
+            "<th style='text-align:left;padding:6px 8px;'>文件</th>"
+            "<th style='text-align:left;padding:6px 8px;'>得分</th>"
+            "<th style='text-align:left;padding:6px 8px;'>片段摘要</th>"
+            "</tr></thead>"
+            f"<tbody>{''.join(body)}</tbody></table></div></details>"
+        )
+
+    final_title = "最终送入上下文的 Top-K"
+    if score_kind == "rerank":
+        final_title += "（重排后）"
+    return summary + _table("向量初筛 Top-N 候选", cand, show_vector=False) + _table(final_title, finals, show_vector=score_kind == "rerank")
+
+
+def _chunk_diag_summary_html(diag: dict[str, Any]) -> str:
+    summary = dict(diag.get("summary") or {})
+    if int(summary.get("total_chunks") or 0) <= 0:
+        return (
+            '<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:0;">'
+            '<p style="margin:0;color:#92400e;">当前向量库为空，或暂时无法读取切片统计。请先完成构建。</p>'
+            "</div>"
+        )
+    return (
+        '<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:0;">'
+        f"<p style='margin:0;'><strong>总块数：</strong>{int(summary.get('total_chunks') or 0)}"
+        f"　<strong>文件数：</strong>{int(summary.get('total_files') or 0)}"
+        f"　<strong>平均字符数：</strong>{summary.get('avg_chars') or 0}</p>"
+        f"<p style='margin:0.35em 0 0 0;'><strong>空块：</strong>{int(summary.get('empty_chunks') or 0)}"
+        f"　<strong>图片提示块：</strong>{int(summary.get('image_hint_chunks') or 0)}"
+        f"　<strong>OCR 提示块：</strong>{int(summary.get('ocr_hint_chunks') or 0)}"
+        f"　<strong>视觉提示块：</strong>{int(summary.get('vision_hint_chunks') or 0)}</p>"
+        "</div>"
+    )
+
+
+def _experiment_compare_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        p = dict(row.get("params") or {})
+        key = (
+            str(p.get("embed_model") or ""),
+            str(p.get("llm_model") or ""),
+            str(p.get("chunk_mode") or ""),
+            int(p.get("chunk_size") or 0),
+            int(p.get("chunk_overlap") or 0),
+            bool(p.get("use_rerank")),
+            int(p.get("top_n") or 0),
+            int(p.get("top_k") or 0),
+        )
+        g = groups.setdefault(
+            key,
+            {
+                "count": 0,
+                "rated_count": 0,
+                "rating_sum": 0.0,
+                "no_ctx_count": 0,
+                "session_ids": set(),
+            },
+        )
+        g["count"] += 1
+        if row.get("session_id") is not None:
+            g["session_ids"].add(int(row["session_id"]))
+        if row.get("rating") is not None:
+            g["rated_count"] += 1
+            g["rating_sum"] += float(row["rating"])
+        ans = str(row.get("answer") or "")
+        if "未检索到任何文档片段" in ans or "根据已知材料无法回答" in ans:
+            g["no_ctx_count"] += 1
+    out: list[list[Any]] = []
+    for key, g in groups.items():
+        avg = round(g["rating_sum"] / g["rated_count"], 2) if g["rated_count"] else "—"
+        out.append(
+            [
+                key[0],
+                key[1],
+                key[2],
+                key[3],
+                key[4],
+                "是" if key[5] else "否",
+                key[6],
+                key[7],
+                g["count"],
+                g["rated_count"],
+                avg,
+                g["no_ctx_count"],
+                len(g["session_ids"]),
+            ]
+        )
+    out.sort(key=lambda x: (-int(x[8]), str(x[0]), str(x[1]), str(x[2])))
+    return out
+
+
 def do_save_uploads(files, max_mb: float, embed_selected: str):
     ing = _lazy_ingest()
     _, msg, paths = ing.save_uploads(cfg, files, max_size_mb=float(max_mb))
@@ -1002,7 +1187,8 @@ def do_build_index(
         final_ok = step.startswith("完成：")
         yield "\n".join(lines)
     if final_ok:
-        eng.refresh_index_cache(cfg, embed_model=embed_model)
+        eng.clear_all_index_caches()
+        eng.refresh_index_cache(cfg, embed_model=embed_model or None)
 
 
 def do_chat_stream(
@@ -1035,7 +1221,7 @@ def do_chat_stream(
     history = _as_messages(history)
     qtext = str(message).strip() if message is not None else ""
     if not qtext:
-        yield _chatbot_value(history), _sources_panel_html([]), gr.update()
+        yield _chatbot_value(history), _sources_panel_html([]), _DIAG_EMPTY_HTML, gr.update()
         return
 
     eng = _lazy_engine()
@@ -1057,7 +1243,7 @@ def do_chat_stream(
             {"role": "user", "content": qtext},
             {"role": "assistant", "content": err},
         ]
-        yield _chatbot_value(new_hist_err), _sources_panel_html([]), _out_msg()
+        yield _chatbot_value(new_hist_err), _sources_panel_html([]), _DIAG_EMPTY_HTML, _out_msg()
         return
 
     new_hist = history + [
@@ -1067,7 +1253,7 @@ def do_chat_stream(
             "content": f"**① 向量检索中…**（初筛 Top-{top_n}）",
         },
     ]
-    yield _chatbot_value(new_hist), _sources_panel_html([]), _out_msg()
+    yield _chatbot_value(new_hist), _sources_panel_html([]), _DIAG_EMPTY_HTML, _out_msg()
 
     try:
         prior_rows = store.fetch_qa_rows_for_session(sid)
@@ -1075,17 +1261,48 @@ def do_chat_stream(
             store.update_session_meta(sid, title=qtext[:60])
 
         nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
+        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
         line1 = f"**① 向量检索完成**（候选 {len(nodes_vec)} 条 · 初筛 Top-{top_n}）"
         new_hist[-1]["content"] = line1
-        yield _chatbot_value(new_hist), _sources_panel_html([]), _out_msg()
+        yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
+            _retrieval_diag_payload(
+                query=qtext,
+                vector_candidates=vector_diag,
+                final_sources=[],
+                top_n=top_n,
+                top_k=top_k,
+                use_rerank=bool(use_rerank),
+                score_kind="vector",
+            )
+        ), _out_msg()
 
         if bool(use_rerank) and nodes_vec:
             new_hist[-1]["content"] = f"{line1}\n\n**② Cross-Encoder 重排中…**"
-            yield _chatbot_value(new_hist), _sources_panel_html([]), _out_msg()
+            yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
+                _retrieval_diag_payload(
+                    query=qtext,
+                    vector_candidates=vector_diag,
+                    final_sources=[],
+                    top_n=top_n,
+                    top_k=top_k,
+                    use_rerank=True,
+                    score_kind="vector",
+                )
+            ), _out_msg()
 
         nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
         sources = eng.nodes_to_source_dicts(nodes, kind)
         src_html = _sources_panel_html(sources)
+        diag_payload = _retrieval_diag_payload(
+            query=qtext,
+            vector_candidates=vector_diag,
+            final_sources=sources,
+            top_n=top_n,
+            top_k=top_k,
+            use_rerank=bool(use_rerank),
+            score_kind=kind,
+        )
+        diag_html = _retrieval_diag_html(diag_payload)
         if not nodes:
             no_ctx = (
                 "**根据已知材料无法回答。**\n\n"
@@ -1094,7 +1311,7 @@ def do_chat_stream(
                 "③ 问题与文档主题是否相关。"
             )
             new_hist[-1]["content"] = no_ctx
-            yield _chatbot_value(new_hist), src_html, _out_msg()
+            yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
             params = eng.build_params_snapshot(
                 cfg,
                 int(chunk_size),
@@ -1112,9 +1329,10 @@ def do_chat_stream(
                 answer=no_ctx,
                 sources=sources,
                 params=params,
+                diagnostics=diag_payload,
                 session_id=sid,
             )
-            yield _chatbot_value(new_hist), src_html, _out_msg()
+            yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
             return
 
         kind_zh = "重排" if kind == "rerank" else "向量截断"
@@ -1131,14 +1349,14 @@ def do_chat_stream(
             )
         sep = "\n\n---\n\n"
         new_hist[-1]["content"] = progress_head + sep
-        yield _chatbot_value(new_hist), src_html, _out_msg()
+        yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
         partial = ""
         for token in eng.stream_answer(
             cfg, qtext, system_prompt, nodes, llm_model=lm, llm_num_ctx=nctx
         ):
             partial += token
             new_hist[-1]["content"] = progress_head + sep + partial
-            yield _chatbot_value(new_hist), src_html, _out_msg()
+            yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
         params = eng.build_params_snapshot(
             cfg,
             int(chunk_size),
@@ -1158,24 +1376,26 @@ def do_chat_stream(
             answer=full_answer,
             sources=sources,
             params=params,
+            diagnostics=diag_payload,
             session_id=sid,
         )
-        yield _chatbot_value(new_hist), src_html, _out_msg()
+        yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
     except Exception:
         tb = traceback.format_exc()
         err = f"生成失败:\n```\n{tb}\n```"
         LAST_QA_ID = None
         new_hist[-1]["content"] = err
-        yield _chatbot_value(new_hist), _sources_panel_html([]), _out_msg()
+        yield _chatbot_value(new_hist), _sources_panel_html([]), _DIAG_EMPTY_HTML, _out_msg()
 
 
-def do_rate_last(rating: float | None, note: str):
-    global LAST_QA_ID
-    if LAST_QA_ID is None:
+def do_rate_last(rating: float | None, note: str, session_id: int | None):
+    sid = int(session_id) if session_id is not None else store.ensure_default_session()
+    row_id = store.get_latest_qa_id_for_session(sid)
+    if row_id is None:
         return "没有可打分的对话（先完成一次问答）。"
     r = int(rating) if rating is not None else None
-    store.update_qa_rating(LAST_QA_ID, r, note or None)
-    return f"已保存评分：id={LAST_QA_ID}"
+    store.update_qa_rating(row_id, r, note or None)
+    return f"已保存评分：id={row_id}"
 
 
 def do_export(fmt: str):
@@ -1188,6 +1408,138 @@ def do_export(fmt: str):
         dest = out_dir / "qa_export.csv"
         store.export_csv(dest)
     return str(dest.resolve())
+
+
+def do_chunk_diagnostics():
+    ing = _lazy_ingest()
+    diag = ing.chunk_diagnostics(cfg)
+    rows = [
+        [
+            str(x.get("file_name") or ""),
+            int(x.get("chunk_count") or 0),
+            x.get("avg_chars") or 0,
+            int(x.get("max_chars") or 0),
+            int(x.get("empty_chunks") or 0),
+            int(x.get("image_hint_chunks") or 0),
+            int(x.get("ocr_hint_chunks") or 0),
+            int(x.get("vision_hint_chunks") or 0),
+        ]
+        for x in diag.get("files") or []
+    ]
+    if not rows:
+        rows = [["（当前无切片统计）", 0, 0, 0, 0, 0, 0, 0]]
+    return _chunk_diag_summary_html(diag), rows
+
+
+def do_experiment_compare():
+    rows = _experiment_compare_rows(store.fetch_all_qa())
+    if not rows:
+        rows = [["（暂无问答记录）", "", "", 0, 0, "否", 0, 0, 0, 0, "—", 0, 0]]
+    return rows
+
+
+def do_batch_replay(
+    raw_questions: str,
+    batch_title: str,
+    system_prompt: str,
+    top_n: int,
+    top_k: int,
+    use_rerank: bool,
+    chunk_size: int,
+    chunk_overlap: int,
+    chunk_mode: str,
+    llm_model: str,
+    llm_num_ctx: float,
+    embed_model: str,
+):
+    eng = _lazy_engine()
+    questions = [line.strip() for line in str(raw_questions or "").splitlines() if line.strip()]
+    if not questions:
+        return "没有可回放的问题。请按“每行一个问题”输入。", [["（暂无结果）", "—", 0, 0, "—", "—"]], gr.update()
+
+    em = (embed_model or "").strip() or None
+    lm = (llm_model or "").strip() or None
+    try:
+        nctx = int(round(float(llm_num_ctx)))
+    except (TypeError, ValueError):
+        nctx = 16384
+    nctx = max(2048, min(nctx, 262144))
+    top_n = max(1, int(top_n))
+    top_k = max(1, min(int(top_k), top_n))
+    cm = (chunk_mode or "sentence").strip().lower()
+
+    index = eng.get_index(cfg, embed_model=em)
+    if index is None:
+        return "当前没有可用索引。请先在“知识库”页完成索引构建。", [["（暂无结果）", "—", 0, 0, "—", "—"]], gr.update()
+
+    title = str(batch_title or "").strip() or f"批量回放 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    sid = store.create_session(title)
+    lines: list[str] = [f"已创建批量回放会话：#{sid} · {title}"]
+    result_rows: list[list[Any]] = []
+
+    for i, qtext in enumerate(questions, start=1):
+        lines.append(f"[{i}/{len(questions)}] {qtext}")
+        nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
+        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
+        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
+        sources = eng.nodes_to_source_dicts(nodes, kind)
+        diag_payload = _retrieval_diag_payload(
+            query=qtext,
+            vector_candidates=vector_diag,
+            final_sources=sources,
+            top_n=top_n,
+            top_k=top_k,
+            use_rerank=bool(use_rerank),
+            score_kind=kind,
+        )
+        params = eng.build_params_snapshot(
+            cfg,
+            int(chunk_size),
+            int(chunk_overlap),
+            top_n,
+            top_k,
+            bool(use_rerank),
+            chunk_mode=cm,
+            llm_model=lm,
+            embed_model=em,
+            llm_num_ctx=nctx,
+        )
+
+        if not nodes:
+            answer = (
+                "**根据已知材料无法回答。**\n\n"
+                "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
+            )
+        else:
+            parts: list[str] = []
+            for token in eng.stream_answer(cfg, qtext, system_prompt, nodes, llm_model=lm, llm_num_ctx=nctx):
+                parts.append(token)
+            answer = "".join(parts).strip() or "（模型未返回正文）"
+        qa_id = store.insert_qa(
+            question=qtext,
+            answer=answer,
+            sources=sources,
+            params=params,
+            diagnostics=diag_payload,
+            session_id=sid,
+        )
+        result_rows.append(
+            [
+                qtext,
+                "命中" if nodes else "未命中",
+                len(nodes_vec),
+                len(nodes),
+                str(sources[0].get("file_name") or "—") if sources else "—",
+                qa_id,
+            ]
+        )
+        lines.append(
+            f"    候选 {len(nodes_vec)} 条，送入上下文 {len(nodes)} 条，已入库 QA#{qa_id}。"
+        )
+
+    if not result_rows:
+        result_rows = [["（暂无结果）", "—", 0, 0, "—", "—"]]
+    return "\n".join(lines), result_rows, gr.update(value=_sessions_table_value())
 
 
 def build_ui():
@@ -2151,12 +2503,30 @@ def build_ui():
                             "变更切分策略或大小后需**重新构建**。参数会写入问答记录。",
                             elem_classes=["rag-tip-block", "rag-tip-block--tight"],
                         )
+                        with gr.Accordion("切片统计诊断", open=False):
+                            btn_chunk_diag = gr.Button("刷新切片统计", variant="secondary", size="sm")
+                            chunk_diag_summary = gr.HTML(value=_chunk_diag_summary_html({"summary": {}}))
+                            chunk_diag_df = gr.Dataframe(
+                                headers=["文件名", "块数", "平均字符", "最大字符", "空块", "图片提示块", "OCR 提示块", "视觉提示块"],
+                                value=[["（当前无切片统计）", 0, 0, 0, 0, 0, 0, 0]],
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2, 3, 4, 5, 6, 7],
+                                col_count=(8, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=220,
+                            )
 
                 kb_files_df.select(_on_kb_file_select, outputs=kb_file_sel)
                 btn_preview_chunks.click(
                     _kb_chunk_preview_html,
                     inputs=[kb_file_sel],
                     outputs=[kb_chunk_preview],
+                )
+                btn_chunk_diag.click(
+                    do_chunk_diagnostics,
+                    outputs=[chunk_diag_summary, chunk_diag_df],
                 )
 
                 btn_save.click(
@@ -2278,6 +2648,10 @@ def build_ui():
                                 label="引用片段与得分",
                                 value=_SOURCES_EMPTY_HTML,
                             )
+                            retrieval_diag = gr.HTML(
+                                label="检索诊断",
+                                value=_DIAG_EMPTY_HTML,
+                            )
                     with gr.Column(scale=2, min_width=280, elem_classes=["rag-chat-col-right"]):
                         gr.Markdown("##### 生成与检索", elem_classes=["rag-chat-right-md"])
                         with gr.Accordion("系统提示词", open=True):
@@ -2344,6 +2718,57 @@ def build_ui():
                             )
                             btn_rate = gr.Button("保存评分", variant="secondary", scale=0)
                         rate_status = gr.Textbox(label="状态", lines=1, max_lines=3)
+                    with gr.Accordion("批量问题回放", open=False):
+                        batch_title = gr.Textbox(
+                            label="回放会话标题",
+                            placeholder="可选：默认自动生成“批量回放 时间”",
+                        )
+                        batch_questions = gr.Textbox(
+                            label="问题列表（每行一个）",
+                            lines=6,
+                            max_lines=12,
+                            placeholder="例如：\n本项目的目标是什么？\n图片增强支持哪些方式？",
+                        )
+                        btn_batch_replay = gr.Button("执行批量回放", variant="primary")
+                        batch_status = gr.Textbox(label="回放日志", lines=6, max_lines=12)
+                        batch_result_df = gr.Dataframe(
+                            headers=["问题", "检索结果", "候选数", "送入上下文", "首个来源文件", "QA ID"],
+                            value=[["（暂无结果）", "—", 0, 0, "—", "—"]],
+                            show_label=False,
+                            interactive=False,
+                            static_columns=[0, 1, 2, 3, 4, 5],
+                            col_count=(6, "fixed"),
+                            type="array",
+                            wrap=False,
+                            max_height=240,
+                        )
+                    with gr.Accordion("实验对比汇总", open=False):
+                        btn_compare = gr.Button("刷新实验对比", variant="secondary", size="sm")
+                        compare_df = gr.Dataframe(
+                            headers=[
+                                "嵌入模型",
+                                "LLM",
+                                "切分策略",
+                                "Chunk",
+                                "Overlap",
+                                "重排",
+                                "Top-N",
+                                "Top-K",
+                                "问答数",
+                                "已评分数",
+                                "平均分",
+                                "拒答/未命中数",
+                                "会话数",
+                            ],
+                            value=[["（暂无问答记录）", "", "", 0, 0, "否", 0, 0, 0, 0, "—", 0, 0]],
+                            show_label=False,
+                            interactive=False,
+                            static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            col_count=(13, "fixed"),
+                            type="array",
+                            wrap=False,
+                            max_height=260,
+                        )
 
                 _chat_inputs = [
                     msg,
@@ -2360,15 +2785,34 @@ def build_ui():
                     embed_dd,
                     session_id,
                 ]
-                send.click(do_chat_stream, _chat_inputs, [chatbot, sources, msg])
-                msg.submit(do_chat_stream, _chat_inputs, [chatbot, sources, msg])
+                send.click(do_chat_stream, _chat_inputs, [chatbot, sources, retrieval_diag, msg])
+                msg.submit(do_chat_stream, _chat_inputs, [chatbot, sources, retrieval_diag, msg])
 
                 def _clear_chat():
-                    return [], _SOURCES_EMPTY_HTML, ""
+                    return [], _SOURCES_EMPTY_HTML, _DIAG_EMPTY_HTML, ""
 
-                btn_clear.click(_clear_chat, outputs=[chatbot, sources, msg])
+                btn_clear.click(_clear_chat, outputs=[chatbot, sources, retrieval_diag, msg])
 
-                btn_rate.click(do_rate_last, [rating, note], rate_status)
+                btn_rate.click(do_rate_last, [rating, note, session_id], rate_status)
+                btn_batch_replay.click(
+                    do_batch_replay,
+                    [
+                        batch_questions,
+                        batch_title,
+                        system_prompt,
+                        top_n,
+                        top_k,
+                        use_rerank,
+                        chunk_size,
+                        chunk_overlap,
+                        chunk_mode,
+                        llm_dd,
+                        llm_num_ctx,
+                        embed_dd,
+                    ],
+                    [batch_status, batch_result_df, session_table],
+                )
+                btn_compare.click(do_experiment_compare, outputs=[compare_df])
 
         demo.load(
             _on_app_load,

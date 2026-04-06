@@ -46,6 +46,7 @@ class ExperimentStore:
                     answer TEXT NOT NULL,
                     sources_json TEXT NOT NULL,
                     params_json TEXT NOT NULL,
+                    diagnostics_json TEXT,
                     rating INTEGER,
                     note TEXT,
                     session_id INTEGER
@@ -90,6 +91,10 @@ class ExperimentStore:
                 conn.execute("ALTER TABLE qa_log ADD COLUMN session_id INTEGER")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE qa_log ADD COLUMN diagnostics_json TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     def log_upload(self, saved_path: str, original_name: str, size_bytes: int) -> None:
@@ -121,6 +126,7 @@ class ExperimentStore:
         answer: str,
         sources: list[dict[str, Any]],
         params: dict[str, Any],
+        diagnostics: dict[str, Any] | None = None,
         rating: int | None = None,
         note: str | None = None,
         session_id: int | None = None,
@@ -128,8 +134,10 @@ class ExperimentStore:
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO qa_log (created_at, question, answer, sources_json, params_json, rating, note, session_id)
-                VALUES (?,?,?,?,?,?,?,?)
+                INSERT INTO qa_log (
+                    created_at, question, answer, sources_json, params_json, diagnostics_json, rating, note, session_id
+                )
+                VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     _utc_now(),
@@ -137,6 +145,7 @@ class ExperimentStore:
                     answer,
                     json.dumps(sources, ensure_ascii=False),
                     json.dumps(params, ensure_ascii=False),
+                    json.dumps(diagnostics or {}, ensure_ascii=False),
                     rating,
                     note,
                     session_id,
@@ -157,7 +166,7 @@ class ExperimentStore:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, created_at, question, answer, sources_json, params_json, rating, note, session_id FROM qa_log ORDER BY id ASC"
+                "SELECT id, created_at, question, answer, sources_json, params_json, diagnostics_json, rating, note, session_id FROM qa_log ORDER BY id ASC"
             ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -169,6 +178,7 @@ class ExperimentStore:
                     "answer": r["answer"],
                     "sources": json.loads(r["sources_json"]),
                     "params": json.loads(r["params_json"]),
+                    "diagnostics": json.loads(r["diagnostics_json"] or "{}"),
                     "rating": r["rating"],
                     "note": r["note"],
                     "session_id": r["session_id"],
@@ -192,6 +202,7 @@ class ExperimentStore:
             "answer",
             "sources_json",
             "params_json",
+            "diagnostics_json",
             "rating",
             "note",
             "session_id",
@@ -208,6 +219,7 @@ class ExperimentStore:
                         "answer": r["answer"],
                         "sources_json": json.dumps(r["sources"], ensure_ascii=False),
                         "params_json": json.dumps(r["params"], ensure_ascii=False),
+                        "diagnostics_json": json.dumps(r.get("diagnostics") or {}, ensure_ascii=False),
                         "rating": r["rating"],
                         "note": r["note"],
                         "session_id": r["session_id"],
@@ -259,7 +271,7 @@ class ExperimentStore:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT id, created_at, question, answer, sources_json, params_json, rating, note
+                SELECT id, created_at, question, answer, sources_json, params_json, diagnostics_json, rating, note
                 FROM qa_log WHERE session_id = ? ORDER BY id ASC
                 """,
                 (session_id,),
@@ -274,11 +286,22 @@ class ExperimentStore:
                     "answer": r["answer"],
                     "sources": json.loads(r["sources_json"]),
                     "params": json.loads(r["params_json"]),
+                    "diagnostics": json.loads(r["diagnostics_json"] or "{}"),
                     "rating": r["rating"],
                     "note": r["note"],
                 }
             )
         return out
+
+    def get_latest_qa_id_for_session(self, session_id: int) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM qa_log WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
 
     def ensure_default_session(self) -> int:
         rows = self.list_sessions(limit=1)

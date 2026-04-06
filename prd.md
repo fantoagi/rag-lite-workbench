@@ -12,8 +12,8 @@
 
 ### 2. 核心业务流程 (User Flow)
 
-1. **语料喂入（离线）**：业务人员上传业务文档 → 在「知识库」选择 **嵌入模型（Ollama）**、**切分策略**与 Chunk / Overlap → 点击构建索引 → 系统将切块向量化并写入本地 Chroma；界面表格展示各文件是否已与最近一次成功构建一致，支持从上传目录移除文件（详见 FR-1）。
-2. **问答验证（在线）**：用户在「对话」选择 **对话模型（LLM）** → 在 **历史会话** 表格中点选行或「新建会话」→ 在聊天框输入问题 → 系统先向量（及可选重排）检索 → **有检索返回的片段时**流式生成答案，并在 **HTML「参考来源」区** 展示引用片段与得分；**当检索结果为空（无任何片段）时不调用大模型**，仅输出固定说明（避免无依据胡答）。*注：若检索到了片段但内容与问题无关，仍会调用大模型；是否拒答由系统提示词与模型共同决定。* 用户可评分、备注；问答按会话落库；**导出 JSON/CSV** 在「对话」页侧栏（见 FR-3、FR-4）。
+1. **语料喂入（离线）**：业务人员上传业务文档 → 在「知识库」选择 **嵌入模型（Ollama）**、**切分策略**与 Chunk / Overlap → 点击构建索引 → 系统将切块向量化并写入本地 Chroma；界面表格展示各文件是否已与最近一次成功构建一致，支持从上传目录移除文件（详见 FR-1）。**索引重建要求具备稳定性保护：新索引未完全成功前，不应破坏上一次可用索引。**
+2. **问答验证（在线）**：用户在「对话」选择 **对话模型（LLM）** → 在 **历史会话** 表格中点选行或「新建会话」→ 在聊天框输入问题 → 系统先向量（及可选重排）检索 → **有检索返回的片段时**流式生成答案，并在 **HTML「参考来源」区** 展示引用片段与得分；**当检索结果为空（无任何片段）时不调用大模型**，仅输出固定说明（避免无依据胡答）。*注：若检索到了片段但内容与问题无关，仍会调用大模型；是否拒答由系统提示词与模型共同决定。* 用户可评分、备注；问答按会话落库；**评分对象为当前会话最近一次入库的问答**；**导出 JSON/CSV** 在「对话」页侧栏（见 FR-3、FR-4）。
 
 ---
 
@@ -25,12 +25,13 @@
 | :--- | :--- | :--- |
 | FR-1.1 | 解析 PDF / TXT / Markdown / DOCX；单文件大小可配置上限 | **已实现**：Gradio 多文件上传到 `uploads`；`ingest.save_uploads` 校验后缀与 `max_file_size_mb`（默认 50MB，与 `config.yaml` 一致）。解析走 LlamaIndex `SimpleDirectoryReader` + 自定义 `file_extractor`：纯文本类按格式读取；**开启图片增强时** PDF/DOCX 走混合读取器，将正文与内嵌图 OCR/视觉结果一并写入文档（详见 FR-1.8）。电子文本型 PDF 为主；扫描件/复杂版式/密码 PDF 不保证。 |
 | FR-1.2 | 界面调节切分策略、Chunk Size、Overlap | **已实现**：「知识库」页 **切分策略**（`sentence` / `token` / `paragraph`）与 Slider；构建时分别对应 `SentenceSplitter`、`TokenTextSplitter`、段落优先的 `SentenceSplitter`（`paragraph_separator="\n\n"`）。参数快照含 `chunk_mode`。 |
-| FR-1.3 | 向量索引本地落盘，无独立向量库服务端 | **已实现**：Chroma `PersistentClient` 写入 `data/chroma`（路径见 `config.yaml`）。 |
-| FR-1.4 | 嵌入模型可选；与 Ollama 已安装模型对齐 | **已实现**：「知识库」嵌入模型下拉框，选项来自 `GET {ollama.base_url}/api/tags` 与 `config.yaml` 可选列表 `embed_models` / 默认 `embed_model` 合并；选择写入 `data/ui_preferences.json`。仅一个候选时控件为只读等效固定展示。 |
+| FR-1.3 | 向量索引本地落盘，无独立向量库服务端 | **已实现**：Chroma `PersistentClient` 写入 `data/chroma`（路径见 `config.yaml`）。**当前实现采用“临时目录构建，成功后替换正式目录”的原子替换语义；若重建失败，保留上一次可用索引。** |
+| FR-1.4 | 嵌入模型可选；与 Ollama 已安装模型对齐 | **已实现**：「知识库」嵌入模型下拉框，选项来自 `GET {ollama.base_url}/api/tags` 与 `config.yaml` 可选列表 `embed_models` / 默认 `embed_model` 合并；选择写入 `data/ui_preferences.json`。仅一个候选时控件为只读等效固定展示。**重建成功后会清空旧的内存索引缓存，再按当前嵌入模型重新加载，避免切换嵌入模型后误用旧索引对象。** |
 | FR-1.5 | 已上传文件与索引状态可见；支持从上传目录移除 | **已实现**：**Gradio Dataframe** 表格展示文件名、大小、相对「上次成功构建」清单的状态（已入库 / 已变更需重建 / 新增未索引等）；若当前所选嵌入模型与上次构建不一致有提示。**点击表格任一行**选中后，可「移除选中文件」删除磁盘文件；向量侧需重新构建以同步。成功构建后 SQLite **`index_manifest`** 记录嵌入模型、切分参数与各文件 mtime/size 快照。 |
 | FR-1.6 | 预览已入库切片（只读） | **已实现**：「预览切片」按表格**行号**解析上传目录中的**真实文件名**（避免界面截断或字符串与 Chroma 不一致）；从 Chroma 按 **node id 批量 `get(ids=…)`** 拉取 `documents`+`metadatas`，避免 offset 分页导致 id 与元数据错位。文件名匹配含顶层/`_node_content` 内字段、递归扫描、子串兜底及同 `ref_doc_id` 归并。预览列表按 **`start_char_idx` → `end_char_idx` → `node_id`** 排序，与**文档正文阅读顺序**一致（字段可从 Chroma 顶层或 `_node_content.metadata` 读取）。失败时提示可核对「向量库中解析到的文件名示例」。 |
 | FR-1.7 | 构建过程可见；日志区域布局稳定 | **已实现**：「构建日志」为流式构建输出；**固定可视高度**（CSS + `lines==max_lines` 关闭 Gradio Textbox 自动撑高）；页面脚本在内容更新后将日志区**滚至底部**。单文件解析（尤其多图 OCR / 视觉）可能较久：`iter_build_index` 在后台线程执行 `load_data()`，主流程**约每秒**输出「仍解析中」心跳行，避免界面长时间无刷新。 |
-| FR-1.8 | PDF/DOCX 内嵌图：OCR + 可选视觉补充 | **已实现**：`ingest.image_enrichment` 为真时，对 PDF/DOCX 内嵌位图走 `HybridPdfReader` / `HybridDocxReader`：`rag_lite/image_text.hybrid_image_to_text` 先 **OCR**（**Tesseract** 或 **PaddleOCR**，由 `ingest.ocr_engine` 与界面「OCR 引擎」决定；Paddle 依赖见 `requirements-paddleocr.txt`），当 OCR 文本长度 **小于** `ocr_skip_vlm_min_chars` 时再调 **Ollama 视觉模型**（`/api/chat` 优先）。正文块标签为 `ocr` / `vision` / `ocr+vision` 等，供溯源区分来源。界面入口在「知识库」→ **「高级」** 折叠：**是否开启图片检索**、OCR 引擎、Tesseract 语言包、视觉模型、跳过视觉阈值；写入 **`data/ui_preferences.json`**（与 `config.yaml` 合并生效）。 |
+| FR-1.8 | PDF/DOCX 内嵌图：OCR + 可选视觉补充 | **已实现**：`ingest.image_enrichment` 为真时，对 PDF/DOCX 内嵌位图走 `HybridPdfReader` / `HybridDocxReader`：`rag_lite/image_text.hybrid_image_to_text` 先 **OCR**（**Tesseract** 或 **PaddleOCR**，由 `ingest.ocr_engine` 与界面「OCR 引擎」决定；Paddle 依赖见 `requirements-paddleocr.txt`），当 OCR 文本长度 **小于** `ocr_skip_vlm_min_chars` 时再调 **Ollama 视觉模型**（`/api/chat` 优先）。正文块标签为 `ocr` / `vision` / `ocr+vision` 等，供溯源区分来源。界面入口在「知识库」→ **「高级」** 折叠：**是否开启图片检索**、OCR 引擎、Tesseract 语言包、视觉模型、跳过视觉阈值；写入 **`data/ui_preferences.json`**（与 `config.yaml` 合并生效）。**当前验证环境默认关闭图片增强，并采用更保守的图片处理参数，优先保证构建速度与主流程稳定；图片专项验证时再手动开启。** |
+| FR-1.9 | 切片质量统计与知识库效果诊断 | **已实现**：新增「**切片统计诊断**」，从当前 Chroma 集合汇总总块数、文件数、平均字符数、空块数，以及各文件的块数、平均/最大字符数、图片提示块、OCR 提示块、视觉提示块，便于验证切片策略与非文本解析效果。 |
 
 #### 模块二：检索与重排 (Retrieval & Rerank)
 
@@ -48,6 +49,7 @@
 | :--- | :--- | :--- |
 | FR-3.1 | 流式对话 | **已实现**：`Ollama.stream_chat` 流式回写到 Gradio Chatbot；**增量与全文两种流式片段**统一累计，避免同一气泡内正文重复输出（`engine.stream_answer`）。对话页可配置 **`llm_num_ctx`**（映射 Ollama `num_ctx`），持久化于 `ui_preferences`。 |
 | FR-3.2 | 底部「参考来源」折叠区：文档名、Chunk、得分 | **已实现**：`gr.HTML` + `_sources_panel_html`：`<details>` 折叠、`<mark>` 高亮片段；向量相似度（Chroma 距离换算）或重排分数展示。 |
+| FR-3.2a | 检索诊断：查看 Top-N 候选、最终 Top-K 与重排变化 | **已实现**：新增 **「检索诊断」** 区，展示候选数、最终上下文数、是否开启重排、是否发生顺序变化，以及向量初筛 Top-N 与最终 Top-K 的文件、得分和片段摘要；同批数据落库到 `qa_log.diagnostics_json`。 |
 | FR-3.3 | 系统提示词可编辑 | **已实现**：对话页多行文本框，写入 `stream_answer` 的 SYSTEM 消息。 |
 | FR-3.4 | 对话模型可选；便于切换对比 | **已实现**：「对话」页 LLM 下拉框，选项来源同 FR-1.4（`llm_models` / `llm_model`）；选择持久化到 `data/ui_preferences.json`。检索/生成分别使用界面选中的 `embed_model`（加载 Chroma 索引）与 `llm_model`（生成）。 |
 | FR-3.5 | 多会话列表；点选查看历史问答 | **已实现**：SQLite **`chat_sessions`**；**`qa_log.session_id`** 关联会话。界面「历史会话」为 **Gradio Dataframe 表格**，**点击一行**切换当前会话内容；「新建会话」开启空对话。 |
@@ -57,8 +59,10 @@
 | 编号 | 需求摘要 | 当前实现 |
 | :--- | :--- | :--- |
 | FR-4.1 | 问答关联参数快照 | **已实现**：`engine.build_params_snapshot` 含 `chunk_mode` / chunk_size / chunk_overlap / top_n / top_k / rerank / `prompt.version` / `llm_model` / `embed_model` / `rerank_model`；随 `insert_qa` 写入 SQLite（含 **session_id**）。 |
-| FR-4.2 | 人工评分与备注落库 | **已实现**：1–5 分 + 备注；`ExperimentStore.update_qa_rating`。 |
+| FR-4.2 | 人工评分与备注落库 | **已实现**：1–5 分 + 备注；`ExperimentStore.update_qa_rating`。**评分对象定位为“当前会话最近一次入库的问答”，不按全局最近一条问答定位。** |
 | FR-4.3 | 导出 JSON / CSV（全库备份） | **已实现**：在 **「对话」Tab 左侧栏**（历史会话下方）选择 json/csv 格式并点击导出；`store.export_json` / `export_csv`（导出字段含 **session_id**）。无独立「实验导出」Tab；日常回顾以会话表格为主，导出为可选备份。 |
+| FR-4.4 | 批量问题回放（基础实验执行） | **已实现**：新增 **「批量问题回放」**，按“每行一个问题”顺序执行，自动创建一个新的批量回放会话，并将问答、参数快照、检索诊断落库。 |
+| FR-4.5 | 实验对比汇总 | **已实现**：新增 **「实验对比汇总」**，按嵌入模型、LLM、切分参数、Top-N/Top-K、是否重排分组，聚合问答数、已评分数、平均分、拒答/未命中数与会话数。 |
 
 ---
 
@@ -98,7 +102,7 @@
 * **表现层**：Gradio — `main.py`。**主界面为两个 Tab**：「知识库」「对话」（默认打开 **对话**）。**知识库**为三列布局（左：已上传文档表、预览切片、固定高度构建日志；中：上传与构建；右：嵌入模型与切分参数）：嵌入模型（标题行 + 第二行下拉与「刷新」按钮）、切分策略、Chunk、上传与索引状态、**预览切片**（按行选中 + 只读块列表）、**固定高度构建日志**等；**「高级」** 折叠内为单文件大小上限与 **图片检索**（OCR 引擎 Tesseract/PaddleOCR、Tesseract 语言包、Ollama 视觉模型、OCR 达字符数则跳过视觉）。**对话**：三栏布局（左：会话表格 + 导出区；中：Chatbot + 引用；右：LLM、**LLM 上下文 num_ctx** 与检索参数）+ 页底可折叠「人工评估」。全库 JSON/CSV 导出在「对话」Tab 左侧，非独立页面。
 * **编排层**：LlamaIndex — `rag_lite/ingest.py`、`rag_lite/engine.py`。
 * **检索增强**：可选 `rag_lite/rerank.py`（Cross-Encoder，不经 Ollama）。
-* **持久化**：Chroma（块向量）+ SQLite（`qa_log`、`upload_log`、**`chat_sessions`**、**`index_manifest`**）— `rag_lite/store.py`；界面模型偏好 — `data/ui_preferences.json`（`rag_lite/prefs.py`）。
+* **持久化**：Chroma（块向量）+ SQLite（`qa_log`、`upload_log`、**`chat_sessions`**、**`index_manifest`**；其中 `qa_log` 额外保存检索诊断 JSON）— `rag_lite/store.py`；界面模型偏好 — `data/ui_preferences.json`（`rag_lite/prefs.py`）。
 * **推理**：Ollama — LLM 与 Embedding；界面所选模型名可与 `config.yaml` 默认不同，以运行时下拉与 `ui_preferences` 为准。
 
 ### 2. 核心架构分层图（目标架构，仍适用）

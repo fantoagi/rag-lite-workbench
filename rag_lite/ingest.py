@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gc
 import json
 import os
 import re
-import time
 import shutil
+import time
 import unicodedata
 from collections.abc import Iterator
 from itertools import zip_longest
@@ -49,6 +50,41 @@ def _allowed_suffix(name: str) -> bool:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _temp_chroma_dir(cfg: AppConfig) -> Path:
+    parent = cfg.chroma_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / f"{cfg.chroma_dir.name}.__building__.{os.getpid()}.{time.time_ns()}"
+
+
+def _activate_built_chroma_dir(cfg: AppConfig, built_dir: Path) -> None:
+    final_dir = cfg.chroma_dir
+    backup_dir = final_dir.parent / f"{final_dir.name}.__backup__.{os.getpid()}.{time.time_ns()}"
+    had_old = final_dir.exists()
+    last_exc: Exception | None = None
+    for attempt in range(6):
+        try:
+            if had_old and final_dir.exists():
+                shutil.move(str(final_dir), str(backup_dir))
+            shutil.move(str(built_dir), str(final_dir))
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            if had_old and backup_dir.exists() and not final_dir.exists():
+                shutil.move(str(backup_dir), str(final_dir))
+            time.sleep(0.2 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _close_chroma_client(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
 
 
 def _node_file_name(node: Any) -> str:
@@ -265,15 +301,18 @@ def iter_build_index(
     import chromadb
     from chromadb.config import Settings as ChromaSettings
 
-    yield "[4/5] 连接 Chroma、清空旧集合并准备写入 …"
+    temp_chroma_dir = _temp_chroma_dir(cfg)
+    try:
+        temp_chroma_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        shutil.rmtree(temp_chroma_dir, ignore_errors=True)
+        temp_chroma_dir.mkdir(parents=True, exist_ok=False)
+
+    yield "[4/5] 准备临时 Chroma 索引目录 …"
     chroma_client = chromadb.PersistentClient(
-        path=str(cfg.chroma_dir),
+        path=str(temp_chroma_dir),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
-    try:
-        chroma_client.delete_collection(cfg.collection_name)
-    except Exception:
-        pass
     chroma_collection = chroma_client.get_or_create_collection(cfg.collection_name)
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -302,7 +341,19 @@ def iter_build_index(
                     shown += f" 等 {len(names)} 个来源"
                 yield f"    └ 已向量化 {done}/{n_total} 块 · 当前批次片段来自：{shown}"
     except Exception as e:
+        shutil.rmtree(temp_chroma_dir, ignore_errors=True)
         yield f"失败：向量化或写入 Chroma 时出错：{e}"
+        return
+
+    yield "    └ 新索引构建完成，正在替换旧索引 …"
+    _close_chroma_client(chroma_client)
+    del index, vector_store, storage_context, chroma_collection, chroma_client
+    gc.collect()
+    try:
+        _activate_built_chroma_dir(cfg, temp_chroma_dir)
+    except Exception as e:
+        shutil.rmtree(temp_chroma_dir, ignore_errors=True)
+        yield f"失败：新索引已构建，但替换旧索引时出错：{e}"
         return
 
     snap = uploaded_files_snapshot(cfg)
@@ -801,6 +852,103 @@ def chroma_sample_distinct_filenames(cfg: AppConfig, limit: int = 30) -> list[st
                 if len(out) >= max(1, int(limit)):
                     return sorted(out, key=_norm_name)
     return sorted(out, key=_norm_name)
+
+
+def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
+    """
+    汇总当前 Chroma 集合的切片质量统计，供验证环境做效果排查。
+    返回：
+      {
+        "summary": {...},
+        "files": [{...}, ...],
+      }
+    """
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+
+    out: dict[str, Any] = {
+        "summary": {
+            "total_chunks": 0,
+            "total_files": 0,
+            "avg_chars": 0,
+            "empty_chunks": 0,
+            "image_hint_chunks": 0,
+            "ocr_hint_chunks": 0,
+            "vision_hint_chunks": 0,
+        },
+        "files": [],
+    }
+    if not cfg.chroma_dir.is_dir():
+        return out
+    try:
+        client = chromadb.PersistentClient(
+            path=str(cfg.chroma_dir),
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+        coll = client.get_collection(cfg.collection_name)
+        all_ids = _chroma_all_ids_paginated(coll)
+        triples = _chroma_get_docs_metas_by_ids(coll, all_ids, batch_size=64)
+    except Exception:
+        return out
+
+    per_file: dict[str, dict[str, Any]] = {}
+    total_chars = 0
+    for _, doc, meta in triples:
+        m = meta if isinstance(meta, dict) else {}
+        file_name = "unknown"
+        for cand in _candidate_file_names_from_meta(m):
+            if cand:
+                file_name = str(Path(cand).name)
+                break
+        text = str(doc or "")
+        chars = len(text)
+        total_chars += chars
+        low = text.casefold()
+        has_page_image = ("[第" in text and "图片" in text) or "[docx 内嵌图" in low
+        has_ocr = "ocr" in low
+        has_vision = "vision" in low or "ocr+vision" in low
+        row = per_file.setdefault(
+            file_name,
+            {
+                "file_name": file_name,
+                "chunk_count": 0,
+                "avg_chars": 0,
+                "max_chars": 0,
+                "empty_chunks": 0,
+                "image_hint_chunks": 0,
+                "ocr_hint_chunks": 0,
+                "vision_hint_chunks": 0,
+                "_char_sum": 0,
+            },
+        )
+        row["chunk_count"] += 1
+        row["_char_sum"] += chars
+        row["max_chars"] = max(int(row["max_chars"]), chars)
+        if chars == 0:
+            row["empty_chunks"] += 1
+        if has_page_image:
+            row["image_hint_chunks"] += 1
+        if has_ocr:
+            row["ocr_hint_chunks"] += 1
+        if has_vision:
+            row["vision_hint_chunks"] += 1
+
+    total_chunks = len(triples)
+    summary = out["summary"]
+    summary["total_chunks"] = total_chunks
+    summary["total_files"] = len(per_file)
+    summary["avg_chars"] = round(total_chars / total_chunks, 1) if total_chunks else 0
+    for row in per_file.values():
+        row["avg_chars"] = round(row.pop("_char_sum") / row["chunk_count"], 1) if row["chunk_count"] else 0
+        summary["empty_chunks"] += int(row["empty_chunks"])
+        summary["image_hint_chunks"] += int(row["image_hint_chunks"])
+        summary["ocr_hint_chunks"] += int(row["ocr_hint_chunks"])
+        summary["vision_hint_chunks"] += int(row["vision_hint_chunks"])
+    out["files"] = sorted(
+        per_file.values(),
+        key=lambda x: (-int(x["chunk_count"]), _norm_name(x["file_name"])),
+    )
+    return out
 
 
 def fetch_chunks_for_file(

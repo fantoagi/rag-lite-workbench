@@ -28,15 +28,16 @@ ollama:
 
 ingest:
   max_file_size_mb: 50
+  # 验证环境默认先关闭图片增强，优先保证构建速度与主流程稳定；需要验证图片内容时再手动开启
   # 为 true 时：PDF/DOCX 内嵌图先 OCR（ingest.ocr_engine：tesseract / paddleocr），文本过短再调 Ollama 视觉模型；需对应依赖与 pull 视觉模型
-  image_enrichment: true
+  image_enrichment: false
   vision_model: llava
   vision_prompt: "请用1-3句中文简要描述图中内容，便于检索；若有文字请尽量读出关键信息。"
   # OCR 字符数 ≥ 此值则不再调用视觉模型（节省构建时间）
-  ocr_skip_vlm_min_chars: 20
-  max_images_per_file: 50
+  ocr_skip_vlm_min_chars: 8
+  max_images_per_file: 5
   min_image_side_px: 24
-  max_image_side_px: 1600
+  max_image_side_px: 768
   # OCR 引擎：tesseract | paddleocr（Paddle 需单独安装，见 requirements-paddleocr.txt）
   ocr_engine: tesseract
   tesseract_lang: chi_sim+eng
