@@ -36,6 +36,11 @@ try {
     & $venvPy -m pip install -r (Join-Path $PSScriptRoot "requirements.txt") --default-timeout=120
     if ($LASTEXITCODE -ne 0) { throw "pip install failed, exit $($LASTEXITCODE)" }
 
+    $ensureImg = Join-Path $PSScriptRoot "rag_lite\ensure_image_deps.py"
+    if (Test-Path $ensureImg) {
+        & $venvPy $ensureImg
+    }
+
     Write-Host "[RAG-Lite] Done. Interpreter: $venvPy"
 }
 catch {

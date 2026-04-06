@@ -1,0 +1,10 @@
+# Optional: PaddleOCR backend (KB - Advanced - OCR engine).
+# Install PaddlePaddle for your OS/Python first, then: pip install -r requirements-paddleocr.txt
+# https://www.paddlepaddle.org.cn/install/quick
+# Example CPU:
+#   python -m pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+#
+# If OCR text is always empty with paddleocr 3.x, try PP-OCR 2.x:
+#   pip install "paddleocr>=2.7,<3"
+paddleocr>=2.7.0
+numpy>=1.21.0

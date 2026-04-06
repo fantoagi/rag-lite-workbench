@@ -39,12 +39,17 @@ try {
     . (Join-Path $PSScriptRoot "bootstrap-venv-pip.ps1")
     Ensure-VenvPip -VenvPythonExe $venvPython -ProjectRoot $PSScriptRoot -BootstrapPip $bootstrap
 
-    Invoke-ProjectPython @("-c", "import gradio")
+    Invoke-ProjectPython @("-c", "import gradio, fitz, pytesseract")
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[RAG-Lite] pip install -r requirements.txt (first run may take a while)..."
         $req = Join-Path $PSScriptRoot "requirements.txt"
         Invoke-ProjectPython @("-m", "pip", "install", "-r", $req, "--default-timeout=120")
         if ($LASTEXITCODE -ne 0) { throw "pip install -r requirements.txt failed, exit $($LASTEXITCODE)" }
+    }
+
+    $ensureImg = Join-Path $PSScriptRoot "rag_lite\ensure_image_deps.py"
+    if (Test-Path $ensureImg) {
+        Invoke-ProjectPython @($ensureImg)
     }
 
     Write-Host "[RAG-Lite] Using: $venvPython"

@@ -2,11 +2,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 if TYPE_CHECKING:
     from llama_index.core.schema import NodeWithScore
 
 _cross_encoder = None
 _cross_model_name: str | None = None
+
+
+def _logits_to_relevance_prob(logits: np.ndarray) -> np.ndarray:
+    """
+    sentence-transformers CrossEncoder（如 BAAI/bge-reranker-*）对 query–passage 输出的是 **logits**，
+    数值常在 [-10, 10] 附近、可为接近 0 的小数；**与向量余弦相似度（常显示为 0.x）不是同一量纲**。
+    映射到 (0,1) 便于界面展示；sigmoid 单调，不改变候选间的排序。
+    """
+    x = np.asarray(logits, dtype=np.float64)
+    x = np.clip(x, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-x))
 
 
 def get_cross_encoder(model_name: str, device: str | None):
@@ -33,10 +46,17 @@ def rerank_nodes(
         return []
     ce = get_cross_encoder(model_name, device)
     pairs = [(query, n.node.get_content(metadata_mode="none")) for n in nodes]
-    scores = ce.predict(pairs)
-    ranked = sorted(zip(scores, nodes), key=lambda x: float(x[0]), reverse=True)
+    logits = np.asarray(ce.predict(pairs), dtype=np.float64)
+    ranked = sorted(zip(logits, nodes), key=lambda x: float(x[0]), reverse=True)
     out: list[NodeWithScore] = []
-    for score, nws in ranked[:top_k]:
-        nws.score = float(score)
+    for logit, nws in ranked[:top_k]:
+        vec_score = nws.score
+        prob = float(_logits_to_relevance_prob(np.array([logit], dtype=np.float64))[0])
+        # 供界面与 node_to_source_dict 对比展示：重排前的向量检索分
+        md = dict(nws.node.metadata or {})
+        if vec_score is not None:
+            md["rag_vector_score"] = float(vec_score)
+        nws.node.metadata = md
+        nws.score = prob
         out.append(nws)
     return out

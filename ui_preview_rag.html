@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG 工作台 · 样式预览（静态，无需运行 Python）</title>
+  <style>
+    :root {
+      font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: #1f2937;
+      background: #f3f4f6;
+    }
+    body { margin: 0; padding: 16px; }
+    .preview-note {
+      background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+      font-size: 0.9rem; color: #1e40af;
+    }
+    .preview-section { margin-bottom: 28px; }
+    .preview-section h2 { font-size: 1rem; margin: 0 0 10px 0; color: #64748b; font-weight: 600; }
+
+    /* —— 以下与 main.py 中 _rag_css 对齐：checkbox + :has() + 相对锚点绝对定位 —— */
+    .rag-workbench-header, .rag-header-title-row, .rag-kb-section-head, .rag-tip-anchor { overflow: visible !important; }
+    .rag-workbench-header { margin-bottom: 0.1rem; }
+    .rag-workbench-header h1 { font-size: 1.35rem; font-weight: 650; margin: 0; letter-spacing: -0.02em; }
+    .rag-header-title-row { display: flex; align-items: center; gap: 0.45rem; flex-wrap: nowrap; margin-bottom: 0; }
+    .rag-tip-anchor { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; }
+    .rag-tip-cb { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; pointer-events: none; }
+    .rag-tip-trigger {
+      display: inline-flex; align-items: center; justify-content: center; border-radius: 50%;
+      border: 1px solid #94a3b8; background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+      color: #475569; font-weight: 800; font-family: inherit; cursor: pointer; user-select: none;
+      box-sizing: border-box; line-height: 1; padding: 0; margin: 0; appearance: none;
+    }
+    .rag-tip-trigger--page { width: 1.35rem; height: 1.35rem; font-size: 0.8rem; }
+    .rag-tip-trigger--h5 { width: 1rem; height: 1rem; font-size: 0.62rem; }
+    .rag-tip-pop {
+      display: none; position: absolute; z-index: 10050; top: calc(100% + 6px); left: 0;
+      min-width: 240px; max-width: min(420px, calc(100vw - 24px)); width: max-content;
+      margin: 0; padding: 0; border: none; background: transparent;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.14); border-radius: 10px; text-align: left;
+    }
+    .rag-tip-pop--wide { min-width: min(400px, 92vw); max-width: min(520px, 92vw); }
+    .rag-tip-anchor:has(.rag-tip-cb:checked) .rag-tip-pop { display: block; }
+    .rag-tip-block { font-size: 0.88rem; line-height: 1.5; color: #475569; padding: 0.4rem 0.65rem; margin: 0;
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; border-left: 3px solid #94a3b8; box-sizing: border-box; }
+    .rag-tip-block--tight { padding: 0.32rem 0.55rem; font-size: 0.82rem; }
+    .rag-tip-block--in-pop { margin: 0 !important; border-radius: 10px; flex: none !important; }
+    .rag-tip-block p { margin: 0.35em 0; line-height: 1.55; }
+    .rag-workbench-tip { opacity: 0.9; font-size: 0.92em; margin-top: 0.45em !important; }
+
+    .rag-kb-section-head { display: flex; align-items: center; gap: 0.35rem; flex-wrap: nowrap; margin: 0 0 0.35rem 0; }
+    .rag-kb-section-head h3 { margin: 0; font-size: 1.15rem; font-weight: 600; line-height: 1.35; }
+    .rag-kb-section-head h5 { margin: 0; font-size: 0.95rem; font-weight: 600; line-height: 1.35; }
+
+    /* 对话页三列示意 */
+    .mock-chat-row { display: flex; gap: 12px; align-items: stretch; background: #fff; border-radius: 10px; padding: 12px; border: 1px solid #e5e7eb; }
+    .mock-col-left { flex: 1 1 26%; min-width: 200px; display: flex; flex-direction: column; gap: 0.35rem; }
+    .mock-col-mid { flex: 2 1 50%; min-height: 200px; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; color: #64748b; font-size: 0.9rem; }
+    .mock-col-right { flex: 1 1 24%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; font-size: 0.85rem; color: #475569; }
+
+    /* 会话表 mock + 选中行 */
+    .mock-table { border: 1px solid #e2e8f0; border-radius: 6px; overflow: hidden; font-size: 0.82rem; }
+    .mock-table-row { display: flex; border-bottom: 1px solid #f1f5f9; cursor: pointer; }
+    .mock-table-row:last-child { border-bottom: none; }
+    .mock-table-row:hover { background: rgba(21, 101, 192, 0.06); }
+    .mock-table-row.selected { background: rgba(21, 101, 192, 0.12) !important; }
+    .mock-table-row > div { padding: 8px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    .mock-table-head { font-weight: 600; background: #f8fafc; color: #475569; }
+
+    .mock-kb-row { display: flex; gap: 12px; background: #fff; border-radius: 10px; padding: 12px; border: 1px solid #e5e7eb; }
+    .mock-kb-left { flex: 1 1 22%; }
+    .mock-kb-mid { flex: 2 1 50%; min-height: 120px; border: 1px dashed #cbd5e1; border-radius: 8px; }
+    .mock-kb-right { flex: 1 1 28%; }
+  </style>
+</head>
+<body>
+
+  <p class="preview-note">
+    本文件为<strong>静态预览</strong>，用于快速查看「感叹号浮层 / 标题行 / 选中行」等样式，<strong>无需运行 Gradio</strong>。
+    用浏览器直接打开本文件即可（双击或拖到浏览器）。实际 Gradio 主题可能与 Soft 主题略有差异。
+  </p>
+
+  <div class="preview-section">
+    <h2>页头 · 感叹号（紧挨图标下方展开）</h2>
+    <div class="rag-workbench-header">
+      <div class="rag-header-title-row">
+        <h1>RAG 验证工作台</h1>
+        <div class="rag-tip-anchor rag-tip-anchor--page">
+          <input type="checkbox" id="rag-tip-cb-page-prev" class="rag-tip-cb" tabindex="-1" aria-hidden="true" />
+          <label for="rag-tip-cb-page-prev" class="rag-tip-trigger rag-tip-trigger--page" title="使用说明">!</label>
+          <div class="rag-tip-pop rag-tip-pop--wide">
+            <div class="rag-tip-block rag-tip-block--in-pop">
+              <p>本地数据与模型，用于检索与生成效果对比。请先运行 Ollama 并拉取所需模型。</p>
+              <p class="rag-workbench-tip">流程：上传文档 → 构建索引 → 对话提问；导出在对话页侧栏。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="preview-section">
+    <h2>对话页 · 左栏（历史会话 / 导出 标题 + !）</h2>
+    <div class="mock-chat-row">
+      <div class="mock-col-left">
+        <div class="rag-kb-section-head rag-kb-section-head--h5">
+          <h5>历史会话</h5>
+          <div class="rag-tip-anchor">
+            <input type="checkbox" id="rag-tip-cb-chat-prev" class="rag-tip-cb" tabindex="-1" aria-hidden="true" />
+            <label for="rag-tip-cb-chat-prev" class="rag-tip-trigger rag-tip-trigger--h5" title="会话列表说明">!</label>
+            <div class="rag-tip-pop">
+              <div class="rag-tip-block rag-tip-block--tight rag-tip-block--in-pop">按更新时间倒序；点击一行切换当前会话。</div>
+            </div>
+          </div>
+        </div>
+        <div class="mock-table">
+          <div class="mock-table-row mock-table-head"><div>会话</div><div>更新时间</div></div>
+          <div class="mock-table-row selected"><div>#10 · 未命名</div><div>2026-04-04 12:00</div></div>
+          <div class="mock-table-row"><div>#9 · 测试</div><div>2026-04-03 09:00</div></div>
+        </div>
+        <button type="button" style="padding:6px 14px;border-radius:8px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-size:0.875rem;align-self:center;">新建会话</button>
+
+        <div class="rag-kb-section-head rag-kb-section-head--h5" style="margin-top:10px;">
+          <h5>导出备份</h5>
+          <div class="rag-tip-anchor">
+            <input type="checkbox" id="rag-tip-cb-exp-prev" class="rag-tip-cb" tabindex="-1" aria-hidden="true" />
+            <label for="rag-tip-cb-exp-prev" class="rag-tip-trigger rag-tip-trigger--h5" title="导出说明">!</label>
+            <div class="rag-tip-pop">
+              <div class="rag-tip-block rag-tip-block--tight rag-tip-block--in-pop">将本地 SQLite 中的 <code>qa_log</code> 导出为 json / csv 全库备份，路径见下方。</div>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;font-size:0.85rem;"><span style="padding:4px 10px;background:#1565c0;color:#fff;border-radius:6px;">json</span><span style="padding:4px 10px;border:1px solid #e5e7eb;border-radius:6px;">csv</span></div>
+      </div>
+      <div class="mock-col-mid">中间：当前会话 / 引用区 / 输入框（Gradio 渲染）</div>
+      <div class="mock-col-right">右侧：生成与检索参数（Gradio 渲染）</div>
+    </div>
+  </div>
+
+  <div class="preview-section">
+    <h2>知识库 · 三列比例示意（2 : 5 : 3）</h2>
+    <div class="mock-kb-row">
+      <div class="mock-kb-left">
+        <div class="rag-kb-section-head rag-kb-section-head--h3">
+          <h3>文档与向量索引</h3>
+          <div class="rag-tip-anchor">
+            <input type="checkbox" id="rag-tip-cb-kb-doc-prev" class="rag-tip-cb" tabindex="-1" aria-hidden="true" />
+            <label for="rag-tip-cb-kb-doc-prev" class="rag-tip-trigger rag-tip-trigger--h3" style="width:1.12rem;height:1.12rem;font-size:0.68rem;" title="本节说明">!</label>
+            <div class="rag-tip-pop">
+              <div class="rag-tip-block rag-tip-block--tight rag-tip-block--in-pop">布局 2:5:3 说明…</div>
+            </div>
+          </div>
+        </div>
+        <div style="height:80px;border:1px solid #e2e8f0;border-radius:6px;background:#fafafa;"></div>
+      </div>
+      <div class="mock-kb-mid"></div>
+      <div class="mock-kb-right"></div>
+    </div>
+  </div>
+
+</body>
+</html>

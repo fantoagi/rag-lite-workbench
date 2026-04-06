@@ -15,10 +15,33 @@ ollama:
   #   - qwen2.5:7b
   # embed_models:
   #   - bge-m3
-  request_timeout: 120.0
+  # 对话流式生成：读超时过短易 httpx.ReadTimeout；本机 CPU 慢或上下文长时可再加大
+  request_timeout: 600.0
+  connect_timeout: 60.0
+  # 部分 Qwen 等模型支持「思考链」；开启时流式可能长时间无正文，界面卡在「正在生成」
+  thinking: false
+  # 发给 LLM 的用户消息（含检索片段）最大字符数，过大易首 token 极慢或超时
+  max_llm_context_chars: 100000
+  # 对话请求里的 num_ctx（LlamaIndex 的 context_window）。Modelfile 若设成 26 万级易吃满显存并回退 CPU；
+  # 工作台默认用较小值更易走 GPU；需要更大可改为 32768、65536，或 -1 表示跟随模型/服务端
+  num_ctx: 16384
 
 ingest:
   max_file_size_mb: 50
+  # 为 true 时：PDF/DOCX 内嵌图先 OCR（ingest.ocr_engine：tesseract / paddleocr），文本过短再调 Ollama 视觉模型；需对应依赖与 pull 视觉模型
+  image_enrichment: true
+  vision_model: llava
+  vision_prompt: "请用1-3句中文简要描述图中内容，便于检索；若有文字请尽量读出关键信息。"
+  # OCR 字符数 ≥ 此值则不再调用视觉模型（节省构建时间）
+  ocr_skip_vlm_min_chars: 20
+  max_images_per_file: 50
+  min_image_side_px: 24
+  max_image_side_px: 1600
+  # OCR 引擎：tesseract | paddleocr（Paddle 需单独安装，见 requirements-paddleocr.txt）
+  ocr_engine: tesseract
+  tesseract_lang: chi_sim+eng
+  # Windows 若未把 tesseract 加入 PATH，可填绝对路径，例如：
+  # tesseract_cmd: "C:/Program Files/Tesseract-OCR/tesseract.exe"
 
 rerank:
   enabled_default: false

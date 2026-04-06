@@ -1,6 +1,8 @@
 # RAG-Lite 沙箱验证平台（MVP）
 
-对应 [`prd.md`](prd.md)：本地 Chroma 向量库 + Ollama（LLM / Embedding，**界面可选并记住上次选择**）+ 可选应用内 Cross-Encoder 重排 + Gradio UI；**知识库**侧管理嵌入模型与切分策略，**对话**侧管理 LLM 与会话历史。
+**一句话**：面向业务与研发的**本地轻量化 RAG 验证工作台**——**Gradio** 界面 + **LlamaIndex** 编排 + **Chroma** 持久化向量 + **Ollama**（LLM / 嵌入）；可选 **sentence-transformers Cross-Encoder** 重排；**知识库**支持 PDF / TXT / Markdown / DOCX，并可对 PDF、DOCX 内嵌图启用 **OCR（Tesseract 或 PaddleOCR）** 与 **Ollama 视觉**补充（见「知识库 → 高级」）。
+
+产品目标与功能清单见 [`prd.md`](prd.md)。界面特性概览：**两个 Tab**（知识库 / 对话，默认进入**对话**）；嵌入模型与切分策略在知识库配置并记住；对话侧管理 LLM、会话、导出与人工评估。
 
 ## 一键启动（Windows）
 
@@ -29,6 +31,8 @@
    若本地无 `bge-m3`，请在界面嵌入模型下拉框中选用已安装的嵌入模型（如 `nomic-embed-text`），或改 `config.yaml` 默认 `embed_model`。
 
 2. **Gradio 版本**：`main.py` 与依赖栈以 **`gradio==5.50.0`**（及 `gradio-client==1.14.0` 等）为锁定目标，与 `huggingface-hub` 1.x / `transformers` 5.x 兼容。若环境里误装了 **Gradio 6+**，`main.py` 会尝试对齐回 5.50。若不想自动执行 pip，可设 **`RAG_LITE_SKIP_AUTO_PIP=1`**。
+
+3. **图片增强（可选）**：在 `config.yaml` 中配置 `ingest.image_enrichment`（**是否默认开启以你仓库里的 `config.yaml` 为准**；当前仓库示例为 `true`，若需加快首次构建可改为 `false`）。开启后，PDF/DOCX 内嵌图先经 **OCR**——引擎为 **`ingest.ocr_engine`**：**`tesseract`**（默认）或 **`paddleocr`**（需额外依赖，见 `requirements-paddleocr.txt`）；OCR 结果字符数 **小于** `ocr_skip_vlm_min_chars` 时再调用 **Ollama 视觉模型**（`ingest.vision_model`，如 `llava`）。`start.bat` / `run.ps1` / `main.py` 会自动补装 **Python 依赖**（pymupdf、pytesseract 等），并在 Windows 上**可选**尝试 **winget** 安装 Tesseract（可能一次 UAC）。**不会在启动时执行 `ollama pull`**；请在本机按需手动拉取嵌入、对话、视觉等模型（例如 `ollama pull bge-m3`、`ollama pull llava`）。若未装 Tesseract，可手动安装或设置 `ingest.tesseract_cmd`。界面在「知识库」→ **「高级」** 折叠内：**是否开启图片检索**、OCR 引擎、Tesseract 语言包、视觉模型、跳过视觉阈值；会写入 **`data/ui_preferences.json`** 并与配置合并。构建大 PDF 时，构建日志会**约每秒**刷新「仍解析中」行，属正常耗时提示。
 
 4. **Python 请用 3.12 或 3.11（Windows 最省心）**；**不要使用 3.14**（Gradio 依赖的 Pillow 等尚无可靠预编译包，pip 会源码编译并常见 **`zlib` / `Failed building wheel for pillow`**）。3.13 若 pip 失败也请改 3.12。**依赖请安装到 `ragZone/.venv`**（`run.ps1` / `start.bat` / `setup-venv.ps1` 会代劳）。手动安装示例：
 
@@ -62,14 +66,28 @@ python -u self_test.py --no-gradio-import --skip-ollama
 
 ## 使用顺序
 
-1. **知识库**：可选 **刷新 Ollama 模型列表** → 选择 **嵌入模型** → 选择 **切分策略**（按句 / Token / 段落优先）与 Chunk / Overlap → 上传 PDF/TXT/Markdown/DOCX →「保存到上传目录」→「构建向量索引」。下方 **表格** 显示各文件大小与相对上次成功构建的**索引状态**；可从上传目录 **移除** 指定文件（删除后若需同步向量请重新构建）。
-2. **对话**：选择 **对话模型（LLM）** → 在 **历史会话** 中切换或「新建会话」→ 设置 Top-N / Top-K、是否重排、系统提示词 → 输入问题并发送；右侧/下方为 **参考来源**（片段与得分）。
-3. **人工评估**：对**最近一次**回答打分并保存（仍针对当前会话内最后一次入库的问答）。
-4. **实验导出**（可选）：导出 **全库** 问答日志为 JSON/CSV（含 `session_id`）；日常查看历史以「对话」页 **会话列表** 为主。
+启动后默认打开 **「对话」** Tab（亦可切换到「知识库」）。
+
+1. **知识库**：三列布局——左列为已上传文档表、预览区与 **构建日志**；中为上传与构建；右列为嵌入模型与切分参数。第一行为「嵌入模型（Ollama）」标题与 `!` 说明；第二行左侧为 **嵌入模型下拉框**，右侧 **「刷新」** 用于重新拉取本机 `ollama list`（与 `config.yaml` 候选合并）。随后选择 **切分策略**（按句 / Token / 段落优先）与 Chunk / Overlap → 上传 PDF/TXT/Markdown/DOCX →「保存到上传目录」→「构建向量索引」。**「高级」** 折叠内可设单文件大小上限，以及 **图片检索**（OCR 引擎 Tesseract/PaddleOCR、语言包、视觉模型、OCR 足够长则跳过视觉）。下方 **表格** 显示各文件大小与相对上次成功构建的**索引状态**；在表格中**点选一行**（选中行即记录行号）后，可点 **「预览切片」**：从本机上传目录按行号取**完整文件名**，再向 Chroma 按 **node id** 拉取块正文与元数据；列表顺序为文档内 **`start_char_idx` / `end_char_idx`**（与原文阅读顺序一致，字段可在元数据顶层或 `_node_content` 内）。左下 **构建日志** 为**固定高度**文本框，构建时长内容在框内滚动，并自动滚到最新行；解析单个大 PDF 时可能出现多行「仍解析中」。可从上传目录 **移除** 指定文件（删除后若需同步向量请重新构建）。
+2. **对话**：选择 **对话模型（LLM）** → 在左侧 **历史会话** 表格中 **点击一行** 切换会话，或使用「新建会话」→ 设置 Top-N / Top-K、是否重排、**LLM 上下文（num_ctx）**、系统提示词 → 输入问题并发送。发送后，助手气泡会依次显示 **① 向量检索** →（若开启重排）**② Cross-Encoder 重排** → **③ 正在生成回答**，然后开始流式输出；中间栏下方为 **参考来源**（片段与得分）。**导出 qa_log**（json/csv）在同页 **左侧栏** 会话表下方。
+3. **人工评估**（「对话」Tab 页底折叠区）：对**最近一次**回答打分并保存（针对当前会话内最后一次入库的问答）。
+4. **全库导出**（可选，与第 2 步同一页）：在左侧栏选择 json/csv 后导出；字段含 `session_id`。无单独「实验导出」页面。
 
 数据目录默认：`ragZone/data/`（`uploads/`、`chroma/`、`rag_lite.db`、`exports/`、**`ui_preferences.json`**）。
 
+### 向量分 vs 重排分（为何数字差很多）
+
+- **未开重排**时，参考来源里的 **「向量检索得分」** 来自向量召回（与嵌入相似度相关，常见为 **0.x** 量级）。
+- **开启 Cross-Encoder 重排**后，参考来源会**同时显示**：**向量检索分**（初筛时的分数）与 **重排相关性（0–1）**，便于对比；二者**量纲不同**，仅作对照。重排按模型 logits **重新排序** Top-N，只改变**顺序**。
+- 若重排后仍拒答，多为片段与问题语义仍不匹配，可调切块、换嵌入/重排模型或增大 Top-N。
+
 ## 故障排除
+
+- **构建向量索引长时间停在「加载文档 / 正在解析某 PDF」**：多为 **PDF 内嵌图多** 且已开启 **图片检索**（OCR + 可选视觉），属计算耗时而非必然报错。构建日志应**约每秒**出现「仍解析中」；若需对比速度可暂时关闭「高级」里的图片检索，或调低 `ingest.max_images_per_file`（`config.yaml`）。若使用 **PaddleOCR**，请确认依赖装在 **`ragZone/.venv`** 内（与 IDE 所用解释器一致）。
+
+- **「已入库」但预览切片提示找不到**：请先**重新点击表格中该行**再点「预览切片」（选中状态存的是**行号**，表格刷新后也建议再点一次）。实现上已用**行号 → 上传目录真实文件名**，并用 **Chroma `get(ids=…)`** 按 id 拉取正文与元数据，避免分页 offset 导致 id 与 metadata 错位。若提示里「向量库解析到的文件名示例」中已有你的文件仍失败，多为**旧进程未重启**未加载最新代码；请保存代码后重启 `main.py`。若仍异常，删除 `data/chroma` 下集合后**重新构建索引**（或确认嵌入模型与构建时一致）。
+
+- **回答里出现整段文字重复两遍**：多为流式解析误把「累计全文」当增量再拼接；已在 `engine.stream_answer` 中修正为**只消费 delta**。若仍偶发重复，多为超小模型（如 `qwen2.5:0.5b`）的生成习惯，可换更大模型或略调 `temperature`（需在代码里为 Ollama 增加参数）。
 
 - **`Failed building wheel for pillow` / `could not be found for zlib`**：几乎总是 **Python 太新（如 3.14）**。请先安装 **Python 3.12**（可与 3.14 共存）；再运行 **`start.bat` / `run.ps1`**：会自动优先使用 `py -3.12` 并**删除不兼容的 `.venv` 再重建**，无需手工删文件夹。若本机只有 3.14、已装 **winget**，脚本也会尝试自动安装 3.12。
 

@@ -100,6 +100,21 @@ class ExperimentStore:
             )
             conn.commit()
 
+    def get_latest_upload_time_for_filename(self, filename: str) -> str | None:
+        """upload_log 中与该 basename 匹配的最新一条上传时间（ISO）。"""
+        fn = Path(filename).name
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT created_at FROM upload_log
+                WHERE original_name = ? OR saved_path LIKE ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (fn, f"%{fn}"),
+            ).fetchone()
+        return str(row["created_at"]) if row else None
+
     def insert_qa(
         self,
         question: str,
