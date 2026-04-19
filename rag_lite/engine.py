@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterator
+import time
+import unicodedata
 
 import httpx
 from ollama import Client as OllamaSdkClient
@@ -9,13 +11,27 @@ from ollama import Client as OllamaSdkClient
 from llama_index.core import Settings
 from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
 from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 
 from rag_lite.config import AppConfig
-from rag_lite.ingest import load_index_from_disk
+from rag_lite.ingest import chunk_diagnostics, load_index_from_disk, resolve_active_chroma_dir, uploaded_files_snapshot
 from rag_lite.rerank import rerank_nodes
+from rag_lite.store import ExperimentStore
 
-_index_cache: dict[str, Any] = {}
+_index_cache: dict[tuple[str | None, str | None], Any] = {}
+
+
+def _index_cache_key(cfg: AppConfig, embed_model: str | None = None) -> tuple[str | None, str | None]:
+    em = embed_model or cfg.ollama.get("embed_model")
+    active_dir = resolve_active_chroma_dir(cfg, allow_legacy=True)
+    active_label = None
+    if active_dir is not None:
+        try:
+            active_label = str(active_dir.resolve())
+        except Exception:
+            active_label = str(active_dir)
+    return em, active_label
 
 
 def _ollama_context_window_for_llm(o: dict[str, Any]) -> int:
@@ -53,33 +69,113 @@ def _ollama_llm_sdk_client(o: dict[str, Any]) -> OllamaSdkClient:
     return OllamaSdkClient(host=base, timeout=timeout)
 
 
+def _ollama_embed_client_kwargs(o: dict[str, Any]) -> dict[str, Any]:
+    base = str(o.get("base_url") or "http://127.0.0.1:11434")
+    read_sec = float(o.get("request_timeout", 600.0))
+    conn_sec = float(o.get("connect_timeout", 60.0))
+    return {
+        "host": base,
+        "timeout": httpx.Timeout(
+            connect=conn_sec,
+            read=read_sec,
+            write=max(read_sec, 120.0),
+            pool=conn_sec,
+        ),
+    }
+
+
+def _embed_model_with_http_timeouts(cfg: AppConfig, model_name: str | None):
+    o = dict(cfg.ollama)
+    name = str(model_name or o.get("embed_model") or "").strip()
+    return OllamaEmbedding(
+        model_name=name,
+        base_url=str(o.get("base_url") or "http://127.0.0.1:11434"),
+        ollama_additional_kwargs={},
+        client_kwargs=_ollama_embed_client_kwargs(o),
+    )
+
+
+def _current_index_embed_model_name(index: Any, cfg: AppConfig) -> str | None:
+    model = getattr(index, "_embed_model", None)
+    return getattr(model, "model_name", None) or cfg.ollama.get("embed_model")
+
+
+def _is_transient_ollama_embed_error(exc: Exception) -> bool:
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError)):
+            return True
+        msg = str(cur).lower()
+        if any(k in msg for k in (
+            "winerror 10054",
+            "connection reset",
+            "forcibly closed",
+            "remote protocol error",
+            "readerror",
+            "connecterror",
+        )):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _vector_retrieve_once(index, query: str, top_n: int):
+    top_n = max(1, top_n)
+    retriever = VectorIndexRetriever(
+        index,
+        similarity_top_k=top_n,
+        embed_model=getattr(index, "_embed_model", None),
+        node_ids=None,
+        callback_manager=getattr(index, "_callback_manager", None),
+        object_map=getattr(index, "_object_map", None),
+    )
+    return retriever.retrieve(_normalize_retrieval_query(query))
+
+
 def clear_all_index_caches() -> None:
     global _index_cache
     _index_cache.clear()
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
 
 
 def refresh_index_cache(cfg: AppConfig, embed_model: str | None = None) -> None:
-    """Reload index from disk for the given embedding model name."""
+    """Reload index from disk for the current embedding model and active Chroma path."""
     global _index_cache
-    em = embed_model or cfg.ollama.get("embed_model")
-    _index_cache[em] = load_index_from_disk(cfg, embed_model_override=em)
+    key = _index_cache_key(cfg, embed_model=embed_model)
+    _index_cache[key] = load_index_from_disk(cfg, embed_model_override=key[0])
 
 
 def get_index(cfg: AppConfig, embed_model: str | None = None):
     global _index_cache
-    em = embed_model or cfg.ollama.get("embed_model")
-    if _index_cache.get(em) is None:
-        _index_cache[em] = load_index_from_disk(cfg, embed_model_override=em)
-    return _index_cache.get(em)
+    key = _index_cache_key(cfg, embed_model=embed_model)
+    if _index_cache.get(key) is None:
+        _index_cache[key] = load_index_from_disk(cfg, embed_model_override=key[0])
+    return _index_cache.get(key)
 
 
-def node_to_source_dict(nws, score_kind: str) -> dict[str, Any]:
+def _node_file_name(nws) -> str:
     node = nws.node
     meta = node.metadata or {}
     file_name = meta.get("file_name")
     if file_name is None and meta.get("file_path"):
         file_name = Path(str(meta["file_path"])).name
-    file_name = file_name or "unknown"
+    return str(file_name or "unknown")
+
+
+def _file_name_sig(name: str) -> str:
+    return unicodedata.normalize("NFKC", str(Path(str(name or "")).name)).casefold().strip()
+
+
+def node_to_source_dict(nws, score_kind: str) -> dict[str, Any]:
+    file_name = _node_file_name(nws)
+    node = nws.node
     text = node.get_content(metadata_mode="none")
     preview = text if len(text) <= 2000 else text[:2000] + "\n…"
     score = nws.score
@@ -90,7 +186,6 @@ def node_to_source_dict(nws, score_kind: str) -> dict[str, Any]:
         "chunk": preview,
         "score": float(score) if score is not None else None,
         "score_kind": score_kind,
-        # 开启重排时由 rerank.py 写入，便于与重排分对照
         "vector_score": float(vec_raw) if vec_raw is not None else None,
     }
 
@@ -99,18 +194,134 @@ def nodes_to_source_dicts(nodes, score_kind: str) -> list[dict[str, Any]]:
     return [node_to_source_dict(n, score_kind) for n in nodes]
 
 
+def _node_context_part(nws, idx: int) -> str:
+    meta = nws.node.metadata or {}
+    name = meta.get("file_name")
+    if name is None and meta.get("file_path"):
+        name = Path(str(meta["file_path"])).name
+    name = name or "unknown"
+    body = nws.node.get_content(metadata_mode="none")
+    return f"[片段 {idx}] 来源文件: {name}\n{body}"
+
+
+def select_nodes_for_answer(
+    cfg: AppConfig,
+    query: str,
+    nodes,
+    *,
+    llm_model: str | None = None,
+    llm_num_ctx: int | None = None,
+) -> tuple[list, bool]:
+    """
+    根据 max_llm_context_chars 选择可完整放入上下文的节点集合，避免
+    「引用来源展示」与「模型实际看到的上下文」不一致。
+    返回 (selected_nodes, truncated)。
+    """
+    nodes_list = list(nodes or [])
+    if not nodes_list:
+        return [], False
+    o = dict(cfg.ollama)
+    if llm_model:
+        o["llm_model"] = llm_model
+    if llm_num_ctx is not None:
+        o["num_ctx"] = int(llm_num_ctx)
+    max_c = int(o.get("max_llm_context_chars", 100_000))
+    q = str(query or "").strip()
+    fixed_len = len("【已知上下文】\n") + len("\n\n【用户问题】\n") + len(q)
+    budget = max_c - fixed_len
+    if budget <= 0:
+        return [], bool(nodes_list)
+    selected: list = []
+    used = 0
+    sep_len = len("\n\n---\n\n")
+    for nws in nodes_list:
+        part = _node_context_part(nws, len(selected) + 1)
+        add = len(part) + (sep_len if selected else 0)
+        if used + add > budget:
+            break
+        selected.append(nws)
+        used += add
+    return selected, (len(selected) < len(nodes_list))
+
+
+def filter_nodes_by_excluded_files(nodes: list, excluded_files: list[str] | tuple[str, ...] | None) -> tuple[list, int]:
+    excluded = {
+        _file_name_sig(x)
+        for x in (excluded_files or [])
+        if str(x or "").strip()
+    }
+    if not excluded:
+        return list(nodes or []), 0
+    kept: list = []
+    excluded_count = 0
+    for nws in nodes or []:
+        if _file_name_sig(_node_file_name(nws)) in excluded:
+            excluded_count += 1
+            continue
+        kept.append(nws)
+    return kept, excluded_count
+
+
+def _normalize_retrieval_query(query: str) -> str:
+    text = unicodedata.normalize("NFKC", str(query or "").strip())
+    if not text:
+        return ""
+    trans = str.maketrans({
+        "“": "",
+        "”": "",
+        "‘": "",
+        "’": "",
+        '"': "",
+        "'": "",
+        "「": "",
+        "」": "",
+        "『": "",
+        "』": "",
+        "《": "",
+        "》": "",
+    })
+    text = text.translate(trans)
+    return " ".join(text.split())
+
+
+def build_anchored_eval_query(question: str, expected_file_names: list[str] | tuple[str, ...] | None) -> tuple[str, list[str]]:
+    base_question = str(question or "").strip()
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for raw in expected_file_names or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        stem = Path(text).stem.strip() or Path(text).name.strip() or text
+        norm = _normalize_retrieval_query(stem)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        anchors.append(stem)
+    if not anchors:
+        return base_question, []
+    anchored = f"参考文档：{'；'.join(anchors)}\n问题：{base_question}" if base_question else f"参考文档：{'；'.join(anchors)}"
+    return anchored, anchors
+
+
 def vector_retrieve(cfg: AppConfig, index, query: str, top_n: int):
     """仅向量初筛（Top-N），供 UI 分阶段展示「检索中」进度。"""
     top_n = max(1, top_n)
-    retriever = VectorIndexRetriever(
-        index,
-        similarity_top_k=top_n,
-        embed_model=getattr(index, "_embed_model", None),
-        node_ids=None,
-        callback_manager=getattr(index, "_callback_manager", None),
-        object_map=getattr(index, "_object_map", None),
-    )
-    return retriever.retrieve(query)
+    normalized_query = _normalize_retrieval_query(query)
+    attempts = max(1, int(cfg.ollama.get("embed_retry_attempts", 2) or 2))
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _vector_retrieve_once(index, normalized_query, top_n)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_ollama_embed_error(exc) or attempt >= attempts:
+                raise
+            setattr(index, "_embed_model", _embed_model_with_http_timeouts(cfg, _current_index_embed_model_name(index, cfg)))
+            time.sleep(min(1.5 * attempt, 3.0))
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 def apply_topk_rerank(
@@ -175,11 +386,13 @@ def retrieve(
     top_n: int,
     top_k: int,
     use_rerank: bool,
+    excluded_files: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[list, str]:
     """Returns (nodes_with_score, score_kind for display)."""
     top_n = max(1, top_n)
     top_k = max(1, min(top_k, top_n))
     nodes = vector_retrieve(cfg, index, query, top_n)
+    nodes, _ = filter_nodes_by_excluded_files(nodes, excluded_files)
     return apply_topk_rerank(cfg, query, nodes, top_k, use_rerank)
 
 
@@ -191,7 +404,14 @@ def stream_answer(
     llm_model: str | None = None,
     llm_num_ctx: int | None = None,
 ) -> Iterator[str]:
-    if not nodes:
+    selected_nodes, context_truncated = select_nodes_for_answer(
+        cfg,
+        query,
+        nodes,
+        llm_model=llm_model,
+        llm_num_ctx=llm_num_ctx,
+    )
+    if not selected_nodes:
         return
     o = dict(cfg.ollama)
     if llm_model:
@@ -201,20 +421,16 @@ def stream_answer(
     read_sec = float(o.get("request_timeout", 600.0))
 
     context_parts: list[str] = []
-    for i, nws in enumerate(nodes, 1):
-        meta = nws.node.metadata or {}
-        name = meta.get("file_name")
-        if name is None and meta.get("file_path"):
-            name = Path(str(meta["file_path"])).name
-        name = name or "unknown"
-        body = nws.node.get_content(metadata_mode="none")
-        context_parts.append(f"[片段 {i}] 来源文件: {name}\n{body}")
+    for i, nws in enumerate(selected_nodes, 1):
+        context_parts.append(_node_context_part(nws, i))
     context_str = "\n\n---\n\n".join(context_parts)
 
     user_content = (
         f"【已知上下文】\n{context_str}\n\n"
         f"【用户问题】\n{query.strip()}"
     )
+    if context_truncated:
+        user_content += "\n\n[系统提示：候选上下文过长，已按片段边界截断尾部。]"
     max_c = int(o.get("max_llm_context_chars", 100_000))
     if len(user_content) > max_c:
         user_content = (
@@ -266,6 +482,102 @@ def stream_answer(
             emitted = full
 
 
+def _safe_manifest(cfg: AppConfig) -> dict[str, Any] | None:
+    try:
+        return ExperimentStore(cfg.sqlite_path).get_index_manifest()
+    except Exception:
+        return None
+
+
+def _safe_active_chroma_label(cfg: AppConfig) -> str | None:
+    active_dir = resolve_active_chroma_dir(cfg, allow_legacy=True)
+    if active_dir is None:
+        return None
+    try:
+        return str(active_dir.resolve())
+    except Exception:
+        return str(active_dir)
+
+
+def _build_index_snapshot(cfg: AppConfig) -> dict[str, Any]:
+    manifest = _safe_manifest(cfg) or {}
+    uploads = uploaded_files_snapshot(cfg)
+    active_label = _safe_active_chroma_label(cfg)
+    manifest_active = str(manifest.get("active_chroma_subdir") or "").strip() or None
+    manifest_files = {
+        str(x.get("name") or "").strip(): x
+        for x in (manifest.get("files") or [])
+        if isinstance(x, dict) and str(x.get("name") or "").strip()
+    }
+    uploads_changed = False
+    for item in uploads:
+        name = str(item.get("name") or "").strip()
+        prev = manifest_files.get(name)
+        if prev is None:
+            uploads_changed = True
+            break
+        if int(prev.get("size", -1)) != int(item.get("size", -2)) or int(prev.get("mtime_ns", -1)) != int(item.get("mtime_ns", -2)):
+            uploads_changed = True
+            break
+    if not uploads_changed:
+        for name in manifest_files:
+            if not any(str(x.get("name") or "").strip() == name for x in uploads):
+                uploads_changed = True
+                break
+    active_matches_manifest = bool(
+        manifest_active
+        and active_label
+        and (active_label == manifest_active or active_label.endswith(manifest_active))
+    )
+    readiness = dict(manifest.get("readiness") or {})
+    final_health = dict(readiness.get("final_health") or {}) if isinstance(readiness.get("final_health"), dict) else {}
+    diag_summary: dict[str, Any] = {}
+    try:
+        diag = chunk_diagnostics(cfg, index=None, prefer_index=True)
+        diag_summary = dict(diag.get("summary") or {})
+    except Exception:
+        diag_summary = {}
+    missing_uploaded = list(readiness.get("missing_uploaded_files") or final_health.get("missing_uploaded_files") or [])
+    readiness_healthy = bool(readiness.get("ok") or final_health.get("ok"))
+    return {
+        "active": {
+            "chroma_dir": active_label,
+        },
+        "manifest": {
+            "build_id": str(manifest.get("build_id") or "").strip() or None,
+            "active_chroma_subdir": manifest_active,
+            "activated_at": str(manifest.get("activated_at") or "").strip() or None,
+            "built_at": str(manifest.get("built_at") or "").strip() or None,
+            "embed_model": str(manifest.get("embed_model") or "").strip() or None,
+            "chunk_mode": str(manifest.get("chunk_mode") or "").strip() or None,
+            "chunk_size": manifest.get("chunk_size"),
+            "chunk_overlap": manifest.get("chunk_overlap"),
+        },
+        "readiness": readiness,
+        "consistency": {
+            "uploads_changed_since_manifest": uploads_changed,
+            "active_dir_matches_manifest": active_matches_manifest,
+            "readiness_healthy": readiness_healthy,
+            "missing_uploaded_files_count": len(missing_uploaded),
+            "missing_uploaded_files_preview": missing_uploaded[:10],
+            "diagnostics_total_files": int(
+                diag_summary.get("total_files")
+                or readiness.get("diagnostics_total_files")
+                or final_health.get("diagnostics_total_files")
+                or 0
+            ),
+            "diagnostics_total_chunks": int(
+                diag_summary.get("total_chunks")
+                or readiness.get("diagnostics_total_chunks")
+                or final_health.get("diagnostics_total_chunks")
+                or 0
+            ),
+            "uploads_file_count": len(uploads),
+            "manifest_file_count": len(manifest_files),
+        },
+    }
+
+
 def build_params_snapshot(
     cfg: AppConfig,
     chunk_size: int,
@@ -277,6 +589,11 @@ def build_params_snapshot(
     llm_model: str | None = None,
     embed_model: str | None = None,
     llm_num_ctx: int | None = None,
+    excluded_files: list[str] | tuple[str, ...] | None = None,
+    excluded_doc_classes: list[str] | tuple[str, ...] | None = None,
+    include_zero_chunk: bool | None = None,
+    query_anchoring_enabled: bool | None = None,
+    query_anchoring_source: str | None = None,
 ) -> dict[str, Any]:
     o = cfg.ollama
     snap: dict[str, Any] = {
@@ -293,4 +610,18 @@ def build_params_snapshot(
     }
     if llm_num_ctx is not None:
         snap["llm_num_ctx"] = int(llm_num_ctx)
+    if query_anchoring_enabled is not None:
+        snap["query_anchoring_enabled"] = bool(query_anchoring_enabled)
+    if query_anchoring_source is not None:
+        snap["query_anchoring_source"] = str(query_anchoring_source or "").strip() or None
+    if excluded_doc_classes is not None:
+        snap["excluded_doc_classes"] = [str(x) for x in excluded_doc_classes if str(x or "").strip()]
+    if include_zero_chunk is not None:
+        snap["include_zero_chunk"] = bool(include_zero_chunk)
+    if excluded_files is not None:
+        cleaned = [str(x) for x in excluded_files if str(x or "").strip()]
+        snap["excluded_files"] = cleaned
+        snap["excluded_file_count"] = len(cleaned)
+        snap["excluded_file_preview"] = cleaned[:10]
+    snap["index_snapshot"] = _build_index_snapshot(cfg)
     return snap

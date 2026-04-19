@@ -162,6 +162,35 @@ _paddle_ocr_warned: bool = False
 _vision_ollama_warned: bool = False
 
 
+def _ocr_text_quality_summary(text: str) -> dict[str, int | bool]:
+    raw = str(text or "").strip()
+    compact = "".join(ch for ch in raw if not ch.isspace())
+    latin = sum(1 for ch in compact if ch.isascii() and ch.isalpha())
+    digits = sum(1 for ch in compact if ch.isdigit())
+    chinese = sum(1 for ch in compact if "\u4e00" <= ch <= "\u9fff")
+    suspicious = False
+    if not raw or len(compact) < 80:
+        suspicious = True
+    elif chinese >= max(20, len(compact) // 8):
+        suspicious = False
+    elif latin >= max(40, chinese * 3):
+        suspicious = True
+    elif digits >= max(20, len(compact) // 3) and chinese < 10:
+        suspicious = True
+    return {
+        "raw_chars": len(raw),
+        "compact_chars": len(compact),
+        "latin_chars": latin,
+        "digit_chars": digits,
+        "chinese_chars": chinese,
+        "suspicious": suspicious,
+    }
+
+
+def _ocr_text_looks_suspicious(text: str) -> bool:
+    return bool(_ocr_text_quality_summary(text).get("suspicious"))
+
+
 def _jpeg_bytes_for_vision(image_bytes: bytes, max_side: int) -> bytes:
     """Shrink + JPEG re-encode so Ollama requests stay small and stable."""
     from PIL import Image
@@ -184,7 +213,7 @@ def _ollama_vision_warn_once(msg: str) -> None:
 def _ocr_tesseract_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
     try:
         import pytesseract
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:
         return ""
 
@@ -197,10 +226,32 @@ def _ocr_tesseract_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
         w, h = img.size
         if min(w, h) < opts.min_image_side_px:
             return ""
-        text = pytesseract.image_to_string(img, lang=opts.tesseract_lang)
-        return (text or "").strip()
+
+        gray = ImageOps.grayscale(img)
+        enlarged = gray
+        if max(w, h) < 1800:
+            enlarged = gray.resize((max(1, gray.width * 2), max(1, gray.height * 2)), Image.Resampling.LANCZOS)
+        contrast = ImageOps.autocontrast(enlarged)
+        binary = contrast.point(lambda p: 255 if p >= 176 else 0, mode="1")
+
+        candidates = [
+            (contrast, "--psm 6"),
+            (contrast, "--psm 11"),
+            (binary, "--psm 6"),
+            (binary, "--psm 11"),
+        ]
+        best = ""
+        for candidate_img, config in candidates:
+            try:
+                text = (pytesseract.image_to_string(candidate_img, lang=opts.tesseract_lang, config=config) or "").strip()
+            except Exception:
+                continue
+            if len(text) > len(best):
+                best = text
+        return best
     except Exception:
         return ""
+
 
 
 def _parse_paddle_v2_lines(page: Any) -> list[str]:
@@ -310,7 +361,7 @@ def _ocr_paddleocr_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
 
         def _run(img_arr: Any) -> list[str]:
             r: Any = None
-            # 3.x: ocr() forwards to predict() ¡ª do not pass cls= (predict() rejects it).
+            # 3.x: ocr() forwards to predict() ï¿½ï¿½ do not pass cls= (predict() rejects it).
             # 2.x: optional cls=True for angle classifier.
             if hasattr(ocr, "ocr") and callable(getattr(ocr, "ocr")):
                 try:
@@ -349,8 +400,14 @@ def _ocr_paddleocr_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
 def ocr_image_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
     eng = (opts.ocr_engine or "tesseract").strip().lower()
     if eng == "paddleocr":
-        return _ocr_paddleocr_bytes(image_bytes, opts)
-    return _ocr_tesseract_bytes(image_bytes, opts)
+        primary = _ocr_paddleocr_bytes(image_bytes, opts)
+        if primary.strip():
+            return primary
+        return _ocr_tesseract_bytes(image_bytes, opts)
+    primary = _ocr_tesseract_bytes(image_bytes, opts)
+    if primary.strip():
+        return primary
+    return ""
 
 
 def ollama_vision_caption(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
@@ -453,12 +510,15 @@ def hybrid_image_to_text(
     Returns (text_block, tag) where tag is 'ocr' | 'vision' | 'ocr+vision' | ''.
     """
     ocr = ocr_image_bytes(image_bytes, opts)
-    if len(ocr) >= opts.ocr_skip_vlm_min_chars:
+    ocr_suspicious = _ocr_text_looks_suspicious(ocr)
+    if not ocr_suspicious and len(ocr) >= opts.ocr_skip_vlm_min_chars:
         return ocr, "ocr" if ocr else ""
     if not allow_vision or not opts.vision_model:
         return ocr, "ocr" if ocr else ""
     vision = ollama_vision_caption(image_bytes, opts)
     vision = vision.strip()
+    if ocr and vision and ocr_suspicious:
+        return vision, "vision"
     if ocr and vision:
         return f"{ocr}\n{vision}", "ocr+vision"
     if vision:

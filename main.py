@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import csv
+import difflib
 import html
 import importlib.metadata
 import importlib.util
+import json
 import operator
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +44,7 @@ _GRADIO_VERSION_PIN = "gradio==5.50.0"
 _GRADIO_CLIENT_PIN = "gradio-client==1.14.0"
 _TOMLKIT_PIN = "tomlkit>=0.12.0,<0.14.0"
 _PYDANTIC_GRADIO_PIN = "pydantic>=2.0,<=2.12.3"
+_CHROMADB_PIN = "chromadb==0.5.23"
 
 
 def _pip_uninstall_gradio_stack() -> None:
@@ -190,6 +195,82 @@ def _ensure_optional_ingest_deps() -> None:
 _ensure_optional_ingest_deps()
 
 
+def _chromadb_version_str() -> str | None:
+    try:
+        if importlib.util.find_spec("chromadb") is None:
+            return None
+        return importlib.metadata.version("chromadb")
+    except Exception:
+        return None
+
+
+def _ensure_chromadb_pin() -> None:
+    """
+    Keep Chroma on the project's validated line.
+    Newer 1.x builds can intermittently fail on HNSW reopen in this workstation setup.
+    """
+    skip = os.environ.get("RAG_LITE_SKIP_AUTO_PIP", "").strip().lower() in ("1", "true", "yes")
+    cv = _chromadb_version_str()
+    if cv == "0.5.23":
+        return
+    if skip:
+        if cv:
+            print(
+                f"[RAG-Lite] 检测到 chromadb {cv}，建议切换到 {_CHROMADB_PIN} 以避免 HNSW 重开异常。",
+                flush=True,
+            )
+        return
+    req = ROOT / "requirements.txt"
+    print(
+        f"[RAG-Lite] 检测到 chromadb 版本为 {cv or '未安装'}，正在对齐到 {_CHROMADB_PIN} …",
+        flush=True,
+    )
+    _pip_install(_CHROMADB_PIN, "chroma-hnswlib>=0.7.6")
+    if req.is_file():
+        # 回装项目顶层依赖，修复 Chroma 降级过程中可能被带偏的传递依赖版本。
+        _pip_install("-r", str(req))
+    cv2 = _chromadb_version_str()
+    if cv2 != "0.5.23":
+        raise SystemExit(
+            f"chromadb 版本仍为 {cv2 or '未知'}，请手动执行：\n"
+            f"  {sys.executable} -m pip install {_CHROMADB_PIN} chroma-hnswlib>=0.7.6 -r requirements.txt"
+        )
+
+
+_ensure_chromadb_pin()
+
+
+def _ensure_chroma_hnswlib() -> None:
+    """Chroma 1.x 在本地持久化索引重开时仍可能触发 hnswlib 依赖。"""
+    skip = os.environ.get("RAG_LITE_SKIP_AUTO_PIP", "").strip().lower() in ("1", "true", "yes")
+    try:
+        has_chromadb = importlib.util.find_spec("chromadb") is not None
+        has_hnswlib = importlib.util.find_spec("hnswlib") is not None
+    except Exception:
+        return
+    if not has_chromadb or has_hnswlib:
+        return
+    if skip:
+        print(
+            "[RAG-Lite] 检测到 chromadb 但缺少 hnswlib（常见报错: Error loading hnsw index）。\n"
+            "[RAG-Lite] 已启用 RAG_LITE_SKIP_AUTO_PIP，请手动执行：\n"
+            f"  {sys.executable} -m pip install chroma-hnswlib",
+            flush=True,
+        )
+        return
+    print("[RAG-Lite] 检测到 chromadb 缺少 hnswlib，正在补装 chroma-hnswlib …", flush=True)
+    _pip_install("chroma-hnswlib")
+    if importlib.util.find_spec("hnswlib") is None:
+        raise SystemExit(
+            "已安装 chroma-hnswlib，但仍无法导入 hnswlib。\n"
+            "请确认解释器为项目 .venv，并手动执行：\n"
+            f"  {sys.executable} -m pip install chroma-hnswlib"
+        )
+
+
+_ensure_chroma_hnswlib()
+
+
 def _purge_gradio_modules() -> None:
     """部分导入失败时 sys.modules 里会留下坏模块，重装后必须先清掉再 import。"""
     for k in list(sys.modules):
@@ -297,8 +378,11 @@ print(
 from rag_lite.config import load_config
 from rag_lite.ingest import (
     _filename_equiv,
+    active_chroma_label,
+    build_excluded_file_set,
     chroma_collection_count,
     chroma_sample_distinct_filenames,
+    resolve_active_chroma_dir,
     uploaded_files_snapshot,
 )
 from rag_lite.ollama_util import list_ollama_models, merge_model_choices
@@ -466,20 +550,125 @@ def session_history_for_chatbot(session_id: int) -> list:
 def kb_embed_warning_markdown(embed_selected: str) -> str:
     manifest = store.get_index_manifest()
     em = manifest.get("embed_model") if manifest else None
-    if not em or em == embed_selected:
-        return ""
+    parts: list[str] = []
+    if em and em != embed_selected:
+        parts.append(
+            "**提示**：磁盘索引由嵌入模型 `" + str(em) + "` 构建，当前选择为 `" + str(embed_selected) + "`。"
+            "若检索报错或效果异常，请改回一致模型或重新构建索引。"
+        )
+    index_state = _build_index_status_snapshot()
+    parts.append(
+        "**当前索引状态**："
+        f"build_id=`{index_state.get('manifest_build_id')}`；"
+        f"uploads=`{int(index_state.get('uploads_file_count') or 0)}`；"
+        f"active一致=`{'是' if index_state.get('active_dir_matches_manifest') else '否'}`；"
+        f"readiness=`{'通过' if index_state.get('readiness_ok') else '未通过'}`；"
+        f"diagnostics=`{int(index_state.get('diagnostics_total_files') or 0)} 文件 / {int(index_state.get('diagnostics_total_chunks') or 0)} 切片`。"
+    )
+    if bool(index_state.get("uploads_changed_since_manifest")):
+        parts.append("**警告**：uploads 已变化但 manifest/索引未同步，请先重建索引。")
+    if int(index_state.get("missing_uploaded_files_count") or 0) > 0:
+        parts.append(
+            f"**警告**：readiness 检测到 {int(index_state.get('missing_uploaded_files_count') or 0)} 个上传文件未进入当前索引。"
+        )
+    return "\n\n".join(parts)
+
+
+def _build_index_status_snapshot() -> dict[str, Any]:
+    manifest = store.get_index_manifest() or {}
+    uploads = uploaded_files_snapshot(cfg)
+    active_dir = resolve_active_chroma_dir(cfg, store=store)
+    active_label = ""
+    if active_dir is not None:
+        try:
+            active_label = str(active_dir.resolve())
+        except Exception:
+            active_label = str(active_dir)
+    manifest_active = str(manifest.get("active_chroma_subdir") or "").strip()
+    manifest_files = {
+        str(x.get("name") or "").strip(): x
+        for x in (manifest.get("files") or [])
+        if isinstance(x, dict) and str(x.get("name") or "").strip()
+    }
+    uploads_changed = False
+    upload_names = {str(x.get("name") or "").strip() for x in uploads if str(x.get("name") or "").strip()}
+    for item in uploads:
+        name = str(item.get("name") or "").strip()
+        prev = manifest_files.get(name)
+        if prev is None:
+            uploads_changed = True
+            break
+        if int(prev.get("size", -1)) != int(item.get("size", -2)) or int(prev.get("mtime_ns", -1)) != int(item.get("mtime_ns", -2)):
+            uploads_changed = True
+            break
+    if not uploads_changed:
+        for name in manifest_files:
+            if name not in upload_names:
+                uploads_changed = True
+                break
+    active_matches_manifest = bool(
+        manifest_active
+        and active_label
+        and (active_label == manifest_active or active_label.endswith(manifest_active))
+    )
+    readiness = dict(manifest.get("readiness") or {})
+    final_health = dict(readiness.get("final_health") or {}) if isinstance(readiness.get("final_health"), dict) else {}
+    return {
+        "active_label": active_label or "（未发现可用索引目录）",
+        "manifest_build_id": str(manifest.get("build_id") or "").strip() or "—",
+        "manifest_active_chroma_subdir": manifest_active or "—",
+        "readiness_ok": bool(readiness.get("ok") or final_health.get("ok")),
+        "uploads_changed_since_manifest": uploads_changed,
+        "active_dir_matches_manifest": active_matches_manifest,
+        "missing_uploaded_files_count": len(
+            list(readiness.get("missing_uploaded_files") or final_health.get("missing_uploaded_files") or [])
+        ),
+        "diagnostics_total_chunks": int(
+            readiness.get("diagnostics_total_chunks") or final_health.get("diagnostics_total_chunks") or 0
+        ),
+        "diagnostics_total_files": int(
+            readiness.get("diagnostics_total_files") or final_health.get("diagnostics_total_files") or 0
+        ),
+        "uploads_file_count": len(uploads),
+    }
+
+
+def _index_state_blocking_message(index_state: dict[str, Any] | None) -> str:
+    state = index_state or {}
+    if bool(state.get("uploads_changed_since_manifest")):
+        return "当前 uploads 已变更但索引未同步，请先重建索引后再继续。"
+    if not bool(state.get("active_dir_matches_manifest")):
+        return "当前激活索引与 manifest 不一致，请先确认当前激活版本。"
+    if not bool(state.get("readiness_ok")):
+        return "当前索引 readiness 未通过，请先修复索引健康状态。"
+    return ""
+
+
+def _index_state_summary_text(index_state: dict[str, Any] | None) -> str:
+    state = index_state or {}
     return (
-        "**提示**：磁盘索引由嵌入模型 `" + str(em) + "` 构建，当前选择为 `" + str(embed_selected) + "`。"
-        "若检索报错或效果异常，请改回一致模型或重新构建索引。"
+        f"build_id={state.get('manifest_build_id') or '—'}；"
+        f"uploads={int(state.get('uploads_file_count') or 0)}；"
+        f"active一致={'是' if state.get('active_dir_matches_manifest') else '否'}；"
+        f"readiness={'通过' if state.get('readiness_ok') else '未通过'}；"
+        f"diagnostics={int(state.get('diagnostics_total_files') or 0)} 文件 / {int(state.get('diagnostics_total_chunks') or 0)} 切片"
     )
 
 
 def kb_files_table_value(embed_selected: str) -> list[list[str]]:
-    """已上传文档表：文件名、大小、上传时间、向量时间、索引状态。"""
     manifest = store.get_index_manifest()
     disk = uploaded_files_snapshot(cfg)
+    index_state = _build_index_status_snapshot()
+    status_rows = [
+        ["[索引状态] build_id", str(index_state.get("manifest_build_id") or "—"), "—", "—", "—"],
+        ["[索引状态] active一致", "是" if index_state.get("active_dir_matches_manifest") else "否", "—", "—", "—"],
+        ["[索引状态] readiness", "通过" if index_state.get("readiness_ok") else "未通过", "—", "—", "—"],
+        ["[索引状态] uploads变化", "是" if index_state.get("uploads_changed_since_manifest") else "否", "—", "—", "—"],
+        ["[索引状态] diagnostics", f"{int(index_state.get('diagnostics_total_files') or 0)} 文件 / {int(index_state.get('diagnostics_total_chunks') or 0)} 切片", "—", "—", "—"],
+        ["[索引状态] 缺失上传文件", str(int(index_state.get("missing_uploaded_files_count") or 0)), "—", "—", "—"],
+    ]
     if not disk:
-        return [["（暂无文件）", "—", "—", "—", "—"]]
+        return status_rows + [["（暂无文件）", "—", "—", "—", "—"]]
     mf_files: dict[str, dict] = {}
     built_at_global = manifest.get("built_at") if manifest else None
     if manifest:
@@ -496,8 +685,27 @@ def kb_files_table_value(embed_selected: str) -> list[list[str]]:
         vec_t = "—"
         st = "未索引"
         if manifest:
+            active_dir = resolve_active_chroma_dir(cfg, store=store)
+            manifest_active = str(manifest.get("active_chroma_subdir") or "").strip()
+            active_label = ""
+            if active_dir is not None:
+                try:
+                    active_label = str(active_dir)
+                except Exception:
+                    active_label = ""
+            active_matches_manifest = bool(
+                manifest_active
+                and active_label
+                and (
+                    active_label == manifest_active
+                    or active_label.endswith(manifest_active)
+                )
+            )
             if prev and prev.get("mtime_ns") == f.get("mtime_ns") and int(prev.get("size", -1)) == sz:
-                st = "✓ 已入库（与上次成功构建一致）"
+                if active_matches_manifest:
+                    st = "✓ 已入库（与当前激活索引一致）"
+                else:
+                    st = "⚠ Manifest 已记录，但当前激活索引版本待确认"
                 vec_t = _format_session_time(prev.get("indexed_at") or built_at_global)
             elif prev:
                 st = "⚠ 文件已变更，需重建索引"
@@ -505,7 +713,7 @@ def kb_files_table_value(embed_selected: str) -> list[list[str]]:
             else:
                 st = "未索引（相对上次构建为新增）"
         out.append([name, sz_s, up_t, vec_t, st])
-    return out
+    return status_rows + out
 
 
 def remove_kb_file(
@@ -577,9 +785,10 @@ def _coerce_kb_row_index(x: Any) -> int | None:
     return int(i)
 
 
-def _kb_chunk_preview_html(row_idx: Any) -> str:
+def _kb_chunk_preview_html(row_idx: Any, embed_selected: str | None = None) -> str:
     """知识库：按当前表格行对应的上传目录真实文件名展示切片（行号解析，避免 State 字符串与向量库不一致）。"""
     ing = _lazy_ingest()
+    eng = _lazy_engine()
     disk = uploaded_files_snapshot(cfg)
     fn = None
     ri = _coerce_kb_row_index(row_idx)
@@ -587,16 +796,29 @@ def _kb_chunk_preview_html(row_idx: Any) -> str:
         fn = disk[ri]["name"]
     if not fn:
         return '<p style="color:#92400e;margin:0;">请先在表格中<strong>点击一行</strong>选中文件。</p>'
-    chunks, total_found = ing.fetch_chunks_for_file(cfg, fn)
+    em = (embed_selected or "").strip() or None
+    index = eng.get_index(cfg, embed_model=em)
+    chunks, total_found, source_info = ing.fetch_chunks_for_file(cfg, fn, index=index, prefer_index=True)
+    chroma_path = html.escape(str(source_info.get("active_chroma_dir") or active_chroma_label(cfg, store=store)))
+    source = str(source_info.get("source") or "none")
+    fallback_used = bool(source_info.get("fallback_used"))
+    fallback_reason = str(source_info.get("fallback_reason") or "")
+    file_diag = dict(source_info.get("file_diag") or {})
+    source_bits = [f"<strong>当前读取来源：</strong>{html.escape(source)}"]
+    if fallback_used:
+        source_bits.append("<strong>已回退到磁盘集合</strong>")
+    if fallback_reason:
+        source_bits.append(f"原因：<code>{html.escape(fallback_reason)}</code>")
+    source_html = f"<p style='margin:0.35em 0 0 0;color:#92400e;font-size:0.9em;'>{'；'.join(source_bits)}</p>" if fallback_used else ""
     if total_found == 0:
-        cc = chroma_collection_count(cfg)
-        chroma_path = html.escape(str(cfg.chroma_dir.resolve()))
+        cc = chroma_collection_count(cfg, index=index, prefer_index=True)
         if cc == 0:
             return (
                 f'<p style="color:#92400e;margin:0;">当前向量库为空（共 0 条，路径：<code>{chroma_path}</code>）。'
                 "请先<strong>构建向量索引</strong>。</p>"
+                f"{source_html}"
             )
-        sample = chroma_sample_distinct_filenames(cfg, limit=24)
+        sample = chroma_sample_distinct_filenames(cfg, limit=24, index=index, prefer_index=True)
         sample_html = ""
         if sample:
             esc = [html.escape(x) for x in sample]
@@ -608,16 +830,33 @@ def _kb_chunk_preview_html(row_idx: Any) -> str:
             )
         return (
             '<p style="color:#92400e;margin:0;">未找到该文件的切片（向量库中共有 '
-            f"<strong>{cc}</strong> 条记录）。请先在表格中<strong>重新点击该行</strong>再预览；"
+            f"<strong>{cc}</strong> 条记录，当前激活路径：<code>{chroma_path}</code>）。"
+            f"<br /><strong>文档状态：</strong>{html.escape(str(file_diag.get('index_status_label') or '未入库（0 块）'))}"
+            f"　<strong>分类：</strong>{html.escape(str(file_diag.get('pdf_doc_class_label') or '—'))}"
+            f"　<strong>依据：</strong>{html.escape(str(file_diag.get('pdf_doc_class_reason_label') or '—'))}"
+            "<br />请先在表格中<strong>重新点击该行</strong>再预览；"
             f"若仍失败，请<strong>重新构建向量索引</strong>，并核对下方文件名是否与「{html.escape(fn)}」一致。"
             f"{sample_html}</p>"
+            f"{source_html}"
         )
     note = ""
     if total_found > len(chunks):
         note = f"（数据库中共 {total_found} 块，以下仅展示前 {len(chunks)} 块）"
+    file_diag_html = ""
+    if file_diag:
+        file_diag_html = (
+            "<p style='margin:0.35em 0 0 0;color:#475569;font-size:0.9em;'>"
+            f"<strong>文档分类：</strong>{html.escape(str(file_diag.get('pdf_doc_class_label') or '—'))}"
+            f"　<strong>依据：</strong>{html.escape(str(file_diag.get('pdf_doc_class_reason_label') or '—'))}"
+            f"　<strong>文本页/总页：</strong>{int(file_diag.get('pdf_text_pages') or 0)}/{int(file_diag.get('pdf_page_count') or 0)}"
+            f"　<strong>可疑页占比：</strong>{int(file_diag.get('pdf_suspicious_page_ratio_pct') or 0)}%"
+            "</p>"
+        )
     head = (
         f'<p style="margin:0 0 10px 0;color:#475569;font-size:0.9em;">'
-        f"匹配到 <strong>{total_found}</strong> 个文本块{note}。</p>"
+        f"匹配到 <strong>{total_found}</strong> 个文本块{note}."
+        f"<br /><strong>当前激活路径：</strong><code>{chroma_path}</code></p>"
+        f"{source_html}{file_diag_html}"
     )
     parts: list[str] = []
     for c in chunks:
@@ -963,11 +1202,23 @@ def _retrieval_diag_payload(
     top_k: int,
     use_rerank: bool,
     score_kind: str,
+    excluded_files: list[str] | None = None,
+    excluded_doc_classes: list[str] | None = None,
+    include_zero_chunk: bool | None = None,
+    excluded_candidate_count: int = 0,
+    raw_query: str | None = None,
+    query_anchors: list[str] | None = None,
 ) -> dict[str, Any]:
     before_names = [str(x.get("file_name") or "") for x in vector_candidates[: max(1, min(top_k, len(vector_candidates)))]]
     after_names = [str(x.get("file_name") or "") for x in final_sources]
+    excluded_clean = [str(x) for x in (excluded_files or []) if str(x or "").strip()]
+    excluded_classes_clean = [str(x) for x in (excluded_doc_classes or []) if str(x or "").strip()]
+    anchor_list = [str(x).strip() for x in (query_anchors or []) if str(x or "").strip()]
     return {
         "query": query,
+        "raw_query": str(raw_query or query),
+        "retrieval_query": query,
+        "query_anchors": anchor_list,
         "top_n": int(top_n),
         "top_k": int(top_k),
         "use_rerank": bool(use_rerank),
@@ -975,6 +1226,12 @@ def _retrieval_diag_payload(
         "candidate_count": len(vector_candidates),
         "final_count": len(final_sources),
         "rerank_changed_order": before_names != after_names if bool(use_rerank) else False,
+        "excluded_files": excluded_clean,
+        "excluded_file_count": len(excluded_clean),
+        "excluded_file_preview": excluded_clean[:10],
+        "excluded_doc_classes": excluded_classes_clean,
+        "include_zero_chunk": bool(include_zero_chunk) if include_zero_chunk is not None else None,
+        "excluded_candidate_count": int(excluded_candidate_count or 0),
         "vector_candidates": _compact_diag_sources(vector_candidates, limit=20),
         "final_contexts": _compact_diag_sources(final_sources, limit=12),
     }
@@ -993,6 +1250,10 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
         f'　<strong>送入上下文：</strong>{int(diag.get("final_count") or 0)}'
         f'　<strong>重排：</strong>{"开启" if use_rerank else "关闭"}'
         f'　<strong>顺序变化：</strong>{"是" if diag.get("rerank_changed_order") else "否"}</p>'
+        f'<p style="margin:0.35em 0 0 0;"><strong>排除候选：</strong>{int(diag.get("excluded_candidate_count") or 0)}'
+        f'　<strong>排除文件数：</strong>{int(diag.get("excluded_file_count") or 0)}'
+        f'　<strong>排除分类：</strong>{html.escape("/".join([str(x) for x in (diag.get("excluded_doc_classes") or [])]) or "—")}'
+        f'　<strong>含 zero-chunk：</strong>{"是" if diag.get("include_zero_chunk") else "否"}</p>'
         f"</div>"
     )
 
@@ -1041,21 +1302,40 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
 
 def _chunk_diag_summary_html(diag: dict[str, Any]) -> str:
     summary = dict(diag.get("summary") or {})
+    chroma_path = html.escape(str(diag.get("collection_active_dir") or diag.get("active_chroma_label") or "（未发现可用索引目录）"))
+    source = html.escape(str(diag.get("collection_source") or "none"))
+    fallback_used = bool(diag.get("collection_fallback_used"))
+    fallback_reason = str(diag.get("collection_fallback_reason") or "")
+    source_line = f"<p style='margin:0.35em 0 0 0;'><strong>当前读取来源：</strong>{source}</p>"
+    if fallback_used:
+        extra = "；<strong>已回退到磁盘集合</strong>"
+        if fallback_reason:
+            extra += f"；原因：<code>{html.escape(fallback_reason)}</code>"
+        source_line = f"<p style='margin:0.35em 0 0 0;color:#92400e;'><strong>当前读取来源：</strong>{source}{extra}</p>"
     if int(summary.get("total_chunks") or 0) <= 0:
         return (
             '<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:0;">'
             '<p style="margin:0;color:#92400e;">当前向量库为空，或暂时无法读取切片统计。请先完成构建。</p>'
+            f"<p style='margin:0.35em 0 0 0;'><strong>当前激活路径：</strong><code>{chroma_path}</code></p>"
+            f"{source_line}"
             "</div>"
         )
     return (
         '<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:0;">'
         f"<p style='margin:0;'><strong>总块数：</strong>{int(summary.get('total_chunks') or 0)}"
         f"　<strong>文件数：</strong>{int(summary.get('total_files') or 0)}"
+        f"　<strong>已入库文件：</strong>{int(summary.get('indexed_files') or 0)}"
+        f"　<strong>未入库文件：</strong>{int(summary.get('zero_chunk_files') or 0)}"
         f"　<strong>平均字符数：</strong>{summary.get('avg_chars') or 0}</p>"
         f"<p style='margin:0.35em 0 0 0;'><strong>空块：</strong>{int(summary.get('empty_chunks') or 0)}"
         f"　<strong>图片提示块：</strong>{int(summary.get('image_hint_chunks') or 0)}"
         f"　<strong>OCR 提示块：</strong>{int(summary.get('ocr_hint_chunks') or 0)}"
         f"　<strong>视觉提示块：</strong>{int(summary.get('vision_hint_chunks') or 0)}</p>"
+        f"<p style='margin:0.35em 0 0 0;'><strong>疑似扫描文件：</strong>{int(summary.get('scan_doc_files') or 0)}"
+        f"　<strong>OCR 污染文件：</strong>{int(summary.get('ocr_polluted_files') or 0)}"
+        f"　<strong>抽取失败文件：</strong>{int(summary.get('extract_failed_files') or 0)}</p>"
+        f"<p style='margin:0.35em 0 0 0;'><strong>当前激活路径：</strong><code>{chroma_path}</code></p>"
+        f"{source_line}"
         "</div>"
     )
 
@@ -1173,6 +1453,7 @@ def do_build_index(
     lines: list[str] = []
     t0 = time.perf_counter()
     final_ok = False
+    eng.clear_all_index_caches()
     for step in ing.iter_build_index(
         cfg,
         int(chunk_size),
@@ -1231,6 +1512,10 @@ def do_chat_stream(
     top_k = max(1, min(int(top_k), top_n))
     cm = (chunk_mode or "sentence").strip().lower()
     lm = (llm_model or "").strip() or None
+    exclusion_info = build_excluded_file_set(cfg, index=index, prefer_index=True)
+    excluded_files = list(exclusion_info.get("excluded_files") or [])
+    excluded_doc_classes = list(exclusion_info.get("excluded_doc_classes") or [])
+    include_zero_chunk = bool(exclusion_info.get("include_zero_chunk"))
     try:
         nctx = int(round(float(llm_num_ctx)))
     except (TypeError, ValueError):
@@ -1245,6 +1530,10 @@ def do_chat_stream(
         ]
         yield _chatbot_value(new_hist_err), _sources_panel_html([]), _DIAG_EMPTY_HTML, _out_msg()
         return
+
+    index_state = _build_index_status_snapshot()
+    index_block_msg = _index_state_blocking_message(index_state)
+    index_summary = _index_state_summary_text(index_state)
 
     new_hist = history + [
         {"role": "user", "content": qtext},
@@ -1262,7 +1551,11 @@ def do_chat_stream(
 
         nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
         vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        line1 = f"**① 向量检索完成**（候选 {len(nodes_vec)} 条 · 初筛 Top-{top_n}）"
+        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
+        line1 = (
+            f"**① 向量检索完成**（候选 {len(nodes_vec)} 条 · 过滤后 {len(nodes_vec_filtered)} 条"
+            f" · 排除 {excluded_candidate_count} 条 · 初筛 Top-{top_n}）"
+        )
         new_hist[-1]["content"] = line1
         yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
             _retrieval_diag_payload(
@@ -1273,6 +1566,10 @@ def do_chat_stream(
                 top_k=top_k,
                 use_rerank=bool(use_rerank),
                 score_kind="vector",
+                excluded_files=excluded_files,
+                excluded_doc_classes=excluded_doc_classes,
+                include_zero_chunk=include_zero_chunk,
+                excluded_candidate_count=excluded_candidate_count,
             )
         ), _out_msg()
 
@@ -1287,11 +1584,22 @@ def do_chat_stream(
                     top_k=top_k,
                     use_rerank=True,
                     score_kind="vector",
+                    excluded_files=excluded_files,
+                    excluded_doc_classes=excluded_doc_classes,
+                    include_zero_chunk=include_zero_chunk,
+                    excluded_candidate_count=excluded_candidate_count,
                 )
             ), _out_msg()
 
-        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
-        sources = eng.nodes_to_source_dicts(nodes, kind)
+        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec_filtered, top_k, bool(use_rerank))
+        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+            cfg,
+            qtext,
+            nodes,
+            llm_model=lm,
+            llm_num_ctx=nctx,
+        )
+        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
         src_html = _sources_panel_html(sources)
         diag_payload = _retrieval_diag_payload(
             query=qtext,
@@ -1301,9 +1609,50 @@ def do_chat_stream(
             top_k=top_k,
             use_rerank=bool(use_rerank),
             score_kind=kind,
+            excluded_files=excluded_files,
+            excluded_doc_classes=excluded_doc_classes,
+            include_zero_chunk=include_zero_chunk,
+            excluded_candidate_count=excluded_candidate_count,
         )
+        diag_payload["context_selected_count"] = len(nodes_for_answer)
+        diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["index_state"] = dict(index_state)
+        diag_payload["index_state_summary"] = index_summary
         diag_html = _retrieval_diag_html(diag_payload)
-        if not nodes:
+        if index_block_msg:
+            blocked = (
+                "**当前索引状态异常，已停止生成回答。**\n\n"
+                f"{index_block_msg}\n\n"
+                f"当前状态：{index_summary}"
+            )
+            new_hist[-1]["content"] = blocked
+            yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
+            params = eng.build_params_snapshot(
+                cfg,
+                int(chunk_size),
+                int(chunk_overlap),
+                top_n,
+                top_k,
+                bool(use_rerank),
+                chunk_mode=cm,
+                llm_model=lm,
+                embed_model=em,
+                llm_num_ctx=nctx,
+                excluded_files=excluded_files,
+                excluded_doc_classes=excluded_doc_classes,
+                include_zero_chunk=include_zero_chunk,
+            )
+            LAST_QA_ID = store.insert_qa(
+                question=qtext,
+                answer=blocked,
+                sources=sources,
+                params=params,
+                diagnostics=diag_payload,
+                session_id=sid,
+            )
+            yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
+            return
+        if not nodes_for_answer:
             no_ctx = (
                 "**根据已知材料无法回答。**\n\n"
                 "本轮**未检索到任何文档片段**，因此**没有**把「已知上下文」发给大模型，回答不应来自你的上传文件。\n\n"
@@ -1323,6 +1672,9 @@ def do_chat_stream(
                 llm_model=lm,
                 embed_model=em,
                 llm_num_ctx=nctx,
+                excluded_files=excluded_files,
+                excluded_doc_classes=excluded_doc_classes,
+                include_zero_chunk=include_zero_chunk,
             )
             LAST_QA_ID = store.insert_qa(
                 question=qtext,
@@ -1339,20 +1691,20 @@ def do_chat_stream(
         if bool(use_rerank) and nodes_vec:
             progress_head = (
                 f"{line1}\n\n"
-                f"**② 重排完成**（{kind_zh}，送入上下文 {len(nodes)} 条）\n\n"
+                f"**② 重排完成**（{kind_zh}，送入上下文 {len(nodes_for_answer)} 条）\n\n"
                 f"**③ 正在生成回答…**"
             )
         else:
             progress_head = (
                 f"{line1}\n\n"
-                f"**③ 正在生成回答…**（未启用重排，送入上下文 {len(nodes)} 条）"
+                f"**③ 正在生成回答…**（未启用重排，送入上下文 {len(nodes_for_answer)} 条）"
             )
         sep = "\n\n---\n\n"
         new_hist[-1]["content"] = progress_head + sep
         yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
         partial = ""
         for token in eng.stream_answer(
-            cfg, qtext, system_prompt, nodes, llm_model=lm, llm_num_ctx=nctx
+            cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
         ):
             partial += token
             new_hist[-1]["content"] = progress_head + sep + partial
@@ -1368,6 +1720,9 @@ def do_chat_stream(
             llm_model=lm,
             embed_model=em,
             llm_num_ctx=nctx,
+            excluded_files=excluded_files,
+            excluded_doc_classes=excluded_doc_classes,
+            include_zero_chunk=include_zero_chunk,
         )
         # 入库保存完整气泡内容（含进度行 + 分隔线 + 正文），切换会话回来时仍能看到各步
         full_answer = (progress_head + sep + partial).strip()
@@ -1410,12 +1765,17 @@ def do_export(fmt: str):
     return str(dest.resolve())
 
 
-def do_chunk_diagnostics():
+def do_chunk_diagnostics(embed_selected: str | None = None):
     ing = _lazy_ingest()
-    diag = ing.chunk_diagnostics(cfg)
+    eng = _lazy_engine()
+    em = (embed_selected or "").strip() or None
+    index = eng.get_index(cfg, embed_model=em)
+    diag = ing.chunk_diagnostics(cfg, index=index, prefer_index=True)
+    diag["active_chroma_label"] = active_chroma_label(cfg, store=store)
     rows = [
         [
             str(x.get("file_name") or ""),
+            str(x.get("index_status_label") or "—"),
             int(x.get("chunk_count") or 0),
             x.get("avg_chars") or 0,
             int(x.get("max_chars") or 0),
@@ -1423,11 +1783,15 @@ def do_chunk_diagnostics():
             int(x.get("image_hint_chunks") or 0),
             int(x.get("ocr_hint_chunks") or 0),
             int(x.get("vision_hint_chunks") or 0),
+            str(x.get("pdf_doc_class_label") or "—"),
+            str(x.get("pdf_doc_class_reason_label") or "—"),
+            f"{int(x.get('pdf_text_pages') or 0)}/{int(x.get('pdf_page_count') or 0)}",
+            int(x.get("pdf_suspicious_page_ratio_pct") or 0),
         ]
         for x in diag.get("files") or []
     ]
     if not rows:
-        rows = [["（当前无切片统计）", 0, 0, 0, 0, 0, 0, 0]]
+        rows = [["（当前无切片统计）", "—", 0, 0, 0, 0, 0, 0, 0, "—", "—", "0/0", 0]]
     return _chunk_diag_summary_html(diag), rows
 
 
@@ -1471,6 +1835,14 @@ def do_batch_replay(
     index = eng.get_index(cfg, embed_model=em)
     if index is None:
         return "当前没有可用索引。请先在“知识库”页完成索引构建。", [["（暂无结果）", "—", 0, 0, "—", "—"]], gr.update()
+    index_state = _build_index_status_snapshot()
+    index_block_msg = _index_state_blocking_message(index_state)
+    if index_block_msg:
+        return index_block_msg, [["（暂无结果）", "—", 0, 0, "—", "—"]], gr.update()
+    exclusion_info = build_excluded_file_set(cfg, index=index, prefer_index=True)
+    excluded_files = list(exclusion_info.get("excluded_files") or [])
+    excluded_doc_classes = list(exclusion_info.get("excluded_doc_classes") or [])
+    include_zero_chunk = bool(exclusion_info.get("include_zero_chunk"))
 
     title = str(batch_title or "").strip() or f"批量回放 {time.strftime('%Y-%m-%d %H:%M:%S')}"
     sid = store.create_session(title)
@@ -1481,8 +1853,16 @@ def do_batch_replay(
         lines.append(f"[{i}/{len(questions)}] {qtext}")
         nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
         vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
-        sources = eng.nodes_to_source_dicts(nodes, kind)
+        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
+        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec_filtered, top_k, bool(use_rerank))
+        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+            cfg,
+            qtext,
+            nodes,
+            llm_model=lm,
+            llm_num_ctx=nctx,
+        )
+        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
         diag_payload = _retrieval_diag_payload(
             query=qtext,
             vector_candidates=vector_diag,
@@ -1491,7 +1871,15 @@ def do_batch_replay(
             top_k=top_k,
             use_rerank=bool(use_rerank),
             score_kind=kind,
+            excluded_files=excluded_files,
+            excluded_doc_classes=excluded_doc_classes,
+            include_zero_chunk=include_zero_chunk,
+            excluded_candidate_count=excluded_candidate_count,
         )
+        diag_payload["context_selected_count"] = len(nodes_for_answer)
+        diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["index_state"] = dict(index_state)
+        diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
         params = eng.build_params_snapshot(
             cfg,
             int(chunk_size),
@@ -1503,16 +1891,21 @@ def do_batch_replay(
             llm_model=lm,
             embed_model=em,
             llm_num_ctx=nctx,
+            excluded_files=excluded_files,
+            excluded_doc_classes=excluded_doc_classes,
+            include_zero_chunk=include_zero_chunk,
         )
 
-        if not nodes:
+        if not nodes_for_answer:
             answer = (
                 "**根据已知材料无法回答。**\n\n"
                 "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
             )
         else:
             parts: list[str] = []
-            for token in eng.stream_answer(cfg, qtext, system_prompt, nodes, llm_model=lm, llm_num_ctx=nctx):
+            for token in eng.stream_answer(
+                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
+            ):
                 parts.append(token)
             answer = "".join(parts).strip() or "（模型未返回正文）"
         qa_id = store.insert_qa(
@@ -1526,20 +1919,1369 @@ def do_batch_replay(
         result_rows.append(
             [
                 qtext,
-                "命中" if nodes else "未命中",
+                "命中" if nodes_for_answer else "未命中",
                 len(nodes_vec),
-                len(nodes),
+                len(nodes_for_answer),
                 str(sources[0].get("file_name") or "—") if sources else "—",
                 qa_id,
             ]
         )
         lines.append(
-            f"    候选 {len(nodes_vec)} 条，送入上下文 {len(nodes)} 条，已入库 QA#{qa_id}。"
+            f"    候选 {len(nodes_vec)} 条，送入上下文 {len(nodes_for_answer)} 条，已入库 QA#{qa_id}。"
         )
 
     if not result_rows:
         result_rows = [["（暂无结果）", "—", 0, 0, "—", "—"]]
     return "\n".join(lines), result_rows, gr.update(value=_sessions_table_value())
+
+def _eval_dataset_choices() -> tuple[list[str], str | None]:
+    rows = store.list_eval_datasets()
+    choices = [f"#{int(r['id'])} | {str(r['name'])} | {int(r.get('case_count') or 0)}题" for r in rows]
+    value = choices[0] if choices else None
+    return choices, value
+
+
+def _parse_eval_dataset_id(choice: str | None) -> int | None:
+    if not choice:
+        return None
+    try:
+        return int(str(choice).split("|", 1)[0].strip().lstrip("#"))
+    except Exception:
+        return None
+
+
+def _split_eval_list_field(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    text = text.replace("\n", "|").replace("，", ",").replace("；", ";")
+    out: list[str] = []
+    for seg in text.replace(";", "|").replace(",", "|").split("|"):
+        s = seg.strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _parse_eval_bool(raw: Any) -> bool:
+    s = str(raw or "").strip().lower()
+    return s in ("1", "true", "yes", "y", "是")
+
+
+def _pick_eval_field(row: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in row:
+            return row.get(name)
+    lowered = {str(k).strip().lower(): v for k, v in row.items()}
+    for name in names:
+        key = str(name).strip().lower()
+        if key in lowered:
+            return lowered[key]
+    return None
+
+
+def _parse_eval_cases_from_file(file_obj: Any) -> list[dict[str, Any]]:
+    if not file_obj:
+        return []
+    path = Path(getattr(file_obj, "name", file_obj))
+    if not path.is_file():
+        return []
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            rows = payload.get("cases") or []
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = []
+    elif suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    elif suffix in (".xlsx", ".xls"):
+        import pandas as pd
+
+        xls = pd.ExcelFile(path)
+        rows = []
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(path, sheet_name=sheet)
+            if df is None or df.empty or len(df.columns) == 0:
+                continue
+            rows.extend(df.fillna("").to_dict(orient="records"))
+    else:
+        raise ValueError("仅支持 .json / .csv / .xlsx / .xls")
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        question = str(
+            _pick_eval_field(
+                row,
+                "question",
+                "问题",
+                "问题 (Question)",
+            )
+            or ""
+        ).strip()
+        if not question:
+            continue
+        qtype = str(_pick_eval_field(row, "问题类型", "question_type", "type") or "").strip()
+        target_chunk = str(
+            _pick_eval_field(
+                row,
+                "应命中片段",
+                "应命中片段 (Target_Chunk_Content)",
+                "target_chunk_content",
+            )
+            or ""
+        ).strip()
+        note = str(_pick_eval_field(row, "note", "备注") or "").strip()
+        out.append(
+            {
+                "question": question,
+                "expected_answer": str(
+                    _pick_eval_field(
+                        row,
+                        "expected_answer",
+                        "标准答案",
+                        "标准答案 (Golden_Answer)",
+                        "golden_answer",
+                    )
+                    or ""
+                ).strip(),
+                "expected_file_names": _split_eval_list_field(
+                    _pick_eval_field(
+                        row,
+                        "expected_file_names",
+                        "expected_files",
+                        "应命中文档",
+                        "应命中文档 (Target_Document)",
+                        "target_document",
+                    )
+                ),
+                "expected_answer_keywords": _split_eval_list_field(
+                    _pick_eval_field(
+                        row,
+                        "expected_answer_keywords",
+                        "answer_keywords",
+                    )
+                ),
+                "expected_chunk_content": target_chunk,
+                "allow_abstain": _parse_eval_bool(
+                    _pick_eval_field(
+                        row,
+                        "allow_abstain",
+                        "是否允许拒答",
+                        "是否允许拒答 (Is_Reject)",
+                        "is_reject",
+                    )
+                ),
+                "tags": ([qtype] if qtype else []) + _split_eval_list_field(_pick_eval_field(row, "tags", "标签")),
+                "note": note,
+            }
+        )
+    return out
+
+
+def _eval_cases_preview_rows(cases: list[dict[str, Any]]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for idx, case in enumerate(cases[:200], start=1):
+        rows.append(
+            [
+                idx,
+                case.get("question") or "",
+                case.get("expected_answer") or "",
+                " | ".join(case.get("expected_file_names") or []),
+                case.get("expected_chunk_content") or "",
+                " | ".join(case.get("expected_answer_keywords") or []),
+                "是" if bool(case.get("allow_abstain")) else "否",
+                " | ".join(case.get("tags") or []),
+            ]
+        )
+    if not rows:
+        rows = [[0, "（暂无样本）", "", "", "", "", ""]]
+    return rows
+
+
+def _eval_dataset_summary_markdown(dataset_id: int | None) -> str:
+    if dataset_id is None:
+        return "未选择评测集。"
+    dataset = store.get_eval_dataset(dataset_id)
+    if dataset is None:
+        return "未找到评测集。"
+    cases = store.fetch_eval_cases(dataset_id)
+    file_expect_count = sum(1 for x in cases if x.get("expected_file_names"))
+    keyword_count = sum(1 for x in cases if x.get("expected_answer_keywords"))
+    abstain_count = sum(1 for x in cases if bool(x.get("allow_abstain")))
+    return (
+        f"评测集：`{dataset.get('name')}`\n\n"
+        f"样本数：`{len(cases)}` 题；含期望文件：`{file_expect_count}` 题；"
+        f"含答案关键词：`{keyword_count}` 题；拒答样本：`{abstain_count}` 题。"
+    )
+
+
+def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
+    try:
+        cases = _parse_eval_cases_from_file(file_obj)
+    except Exception as e:
+        msg = f"导入失败：{type(e).__name__}: {e}"
+        if "openpyxl" in str(e).lower():
+            msg += "。当前环境缺少 Excel 依赖，请在项目 .venv 中重新安装 requirements.txt。"
+        choices, value = _eval_dataset_choices()
+        return (
+            msg,
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", ""]],
+            "未导入评测集。",
+        )
+    if not cases:
+        choices, value = _eval_dataset_choices()
+        return (
+            "导入失败：文件里没有有效样本；至少需要 question 字段。",
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", ""]],
+            "未导入评测集。",
+        )
+    name = str(dataset_name or "").strip()
+    if not name:
+        name = Path(getattr(file_obj, "name", file_obj)).stem
+    dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
+    choices, _ = _eval_dataset_choices()
+    choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
+    return (
+        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
+        gr.update(choices=choices, value=choice_value),
+        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
+        _eval_dataset_summary_markdown(dataset_id),
+    )
+
+
+def do_eval_dataset_select(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return "未选择评测集。", [[0, "（暂无样本）", "", "", "", "", ""]]
+    return _eval_dataset_summary_markdown(dataset_id), _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id))
+
+
+def _normalize_eval_text(text: Any) -> str:
+    s = str(text or "").strip().lower()
+    return "".join(ch for ch in s if not ch.isspace())
+
+
+def _normalize_eval_filename_key(text: Any) -> str:
+    s = _normalize_eval_text(Path(str(text or "")).stem)
+    return "".join(ch for ch in s if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+
+
+def _eval_filename_alias_keys(text: Any) -> set[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    stem = Path(raw).stem
+    variants = {stem}
+    cleaned = re.sub(r"^[A-Za-z]{2,}\d+\+?", "", stem, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^[A-Za-z]+\d+\+?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^[\W_]+", "", cleaned)
+    variants.add(cleaned)
+    for suffix in ("-高校精品", "高校精品", "-精品", "精品"):
+        if cleaned.endswith(suffix):
+            variants.add(cleaned[: -len(suffix)])
+    return {k for v in variants if v and (k := _normalize_eval_filename_key(v))}
+
+
+def _candidate_eval_filename_keys(name: str) -> set[str]:
+    raw = str(name or "").strip()
+    if not raw:
+        return set()
+    base = Path(raw).name
+    stem = Path(base).stem
+    keys = {
+        str(base).strip().lower(),
+        _normalize_eval_text(base),
+        _normalize_eval_filename_key(base),
+        _normalize_eval_text(stem),
+        _normalize_eval_filename_key(stem),
+    }
+    keys.update(_eval_filename_alias_keys(base))
+    return {k for k in keys if k}
+
+
+def _resolve_expected_eval_file_details(expected_values: list[Any]) -> dict[str, Any]:
+    raw_values = [str(x).strip() for x in (expected_values or []) if str(x).strip()]
+    details: list[dict[str, Any]] = []
+    if not raw_values:
+        return {
+            "raw_values": [],
+            "resolved_files": [],
+            "unresolved_files": [],
+            "ambiguous_files": [],
+            "has_unresolved": False,
+            "has_ambiguous": False,
+        }
+    disk_files = [str(x.get("name") or "").strip() for x in uploaded_files_snapshot(cfg) if str(x.get("name") or "").strip()]
+    disk_set = {name.lower() for name in disk_files}
+    disk_key_map: dict[str, set[str]] = {}
+
+    def _add_key(key: str, target: str) -> None:
+        if not key:
+            return
+        disk_key_map.setdefault(key, set()).add(target)
+
+    for name in disk_files:
+        lowered = name.lower()
+        _add_key(lowered, lowered)
+        for key in _candidate_eval_filename_keys(name):
+            _add_key(key, lowered)
+
+    resolved_set: set[str] = set()
+    unresolved: list[str] = []
+    ambiguous: list[dict[str, Any]] = []
+    for raw in raw_values:
+        lowered = raw.lower()
+        matched: set[str] = set()
+        if lowered in disk_set:
+            matched.add(lowered)
+        else:
+            for key in _candidate_eval_filename_keys(raw):
+                matched.update(disk_key_map.get(key) or set())
+        matched_sorted = sorted(matched)
+        if len(matched_sorted) == 1:
+            resolved_set.update(matched_sorted)
+            details.append({"raw": raw, "matches": matched_sorted, "status": "resolved"})
+        elif len(matched_sorted) > 1:
+            ambiguous.append({"raw": raw, "matches": matched_sorted})
+            details.append({"raw": raw, "matches": matched_sorted, "status": "ambiguous"})
+        else:
+            unresolved.append(raw)
+            details.append({"raw": raw, "matches": [], "status": "unresolved"})
+    return {
+        "raw_values": raw_values,
+        "resolved_files": sorted(resolved_set),
+        "unresolved_files": unresolved,
+        "ambiguous_files": ambiguous,
+        "has_unresolved": bool(unresolved),
+        "has_ambiguous": bool(ambiguous),
+        "details": details,
+    }
+
+
+def _resolve_expected_eval_files(expected_values: list[Any]) -> set[str]:
+    return set(_resolve_expected_eval_file_details(expected_values).get("resolved_files") or [])
+
+
+def _eval_filename_matches_expected(actual_name: str, expected_names: set[str], expected_raw_values: list[Any] | None = None) -> bool:
+    actual = str(actual_name or "").strip()
+    if not actual:
+        return False
+    actual_lower = actual.lower()
+    if actual_lower in expected_names:
+        return True
+    actual_keys = _candidate_eval_filename_keys(actual)
+    actual_stem_key = _normalize_eval_filename_key(Path(actual).stem)
+
+    for expected in list(expected_names) + [str(x).strip().lower() for x in (expected_raw_values or []) if str(x).strip()]:
+        if not expected:
+            continue
+        if actual_lower == expected:
+            return True
+        if _filename_equiv(actual, expected):
+            return True
+        expected_keys = _candidate_eval_filename_keys(expected)
+        if actual_keys & expected_keys:
+            return True
+        expected_stem_key = _normalize_eval_filename_key(Path(expected).stem)
+        if actual_stem_key and expected_stem_key:
+            if len(actual_stem_key) >= 4 and actual_stem_key in expected_stem_key:
+                return True
+            if len(expected_stem_key) >= 4 and expected_stem_key in actual_stem_key:
+                return True
+    return False
+
+
+def _file_list_hits_expected(file_names: list[str], expected_names: set[str], expected_raw_values: list[Any] | None = None) -> bool | None:
+    if not expected_names and not any(str(x).strip() for x in (expected_raw_values or [])):
+        return None
+    return any(_eval_filename_matches_expected(name, expected_names, expected_raw_values) for name in file_names)
+
+
+def _text_match_loose(expect_text: str, actual_text: str) -> bool:
+    a = _normalize_eval_text(expect_text)
+    b = _normalize_eval_text(actual_text)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    ratio = difflib.SequenceMatcher(None, a[:4000], b[:4000]).ratio()
+    if ratio >= 0.6:
+        return True
+    if len(a) >= 20 and len(b) >= 20:
+        short = a if len(a) <= len(b) else b
+        long = b if len(a) <= len(b) else a
+        common = 0
+        for i in range(0, max(1, len(short) - 7), 8):
+            seg = short[i : i + 24]
+            if seg and seg in long:
+                common = max(common, len(seg))
+        if common >= 24 and ratio >= 0.35:
+            return True
+    return False
+
+
+def _is_abstain_answer(answer: str) -> bool:
+    s = str(answer or "")
+    return ("无法回答" in s) or ("未检索到任何文档片段" in s)
+
+
+def _evaluate_case_result(
+    case: dict[str, Any],
+    vector_diag: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    answer: str,
+) -> dict[str, Any]:
+    expected_raw_files = [str(x).strip() for x in (case.get("expected_file_names") or []) if str(x).strip()]
+    expected_info = _resolve_expected_eval_file_details(expected_raw_files)
+    expected_files = set(expected_info.get("resolved_files") or [])
+    candidate_file_list = [str(x.get("file_name") or "").strip() for x in vector_diag if str(x.get("file_name") or "").strip()]
+    context_file_list = [str(x.get("file_name") or "").strip() for x in sources if str(x.get("file_name") or "").strip()]
+    candidate_hit = _file_list_hits_expected(candidate_file_list, expected_files, expected_raw_files)
+    context_hit = _file_list_hits_expected(context_file_list, expected_files, expected_raw_files)
+    expected_chunk = str(case.get("expected_chunk_content") or "").strip()
+    chunk_hit: bool | None = None
+    if expected_chunk:
+        chunk_hit = any(_text_match_loose(expected_chunk, str(x.get("chunk") or "")) for x in sources)
+
+    expected_answer = _normalize_eval_text(case.get("expected_answer"))
+    answer_norm = _normalize_eval_text(answer)
+    keywords = [_normalize_eval_text(x) for x in (case.get("expected_answer_keywords") or []) if _normalize_eval_text(x)]
+    answer_hit: bool | None = None
+    if keywords:
+        answer_hit = all(k in answer_norm for k in keywords)
+    elif expected_answer:
+        answer_hit = expected_answer in answer_norm
+
+    abstain_expected = bool(case.get("allow_abstain"))
+    abstain_actual = _is_abstain_answer(answer)
+    abstain_correct = abstain_actual == abstain_expected
+
+    matched_candidates = [
+        name for name in candidate_file_list if _eval_filename_matches_expected(name, expected_files, expected_raw_files)
+    ]
+    filtered_out = bool(candidate_file_list) and not bool(context_file_list) and candidate_hit is True and context_hit is False
+    target_file_hit_but_chunk_miss = bool(context_hit is True and expected_chunk and chunk_hit is False)
+    issue_codes: list[str] = []
+    if bool(expected_info.get("has_unresolved")):
+        issue_codes.append("EXPECTED_FILE_UNRESOLVED")
+    if bool(expected_info.get("has_ambiguous")):
+        issue_codes.append("EXPECTED_FILE_AMBIGUOUS")
+    if filtered_out:
+        issue_codes.append("FILTERED_OUT")
+    if candidate_hit is False:
+        issue_codes.append("TARGET_FILE_MISS")
+    if target_file_hit_but_chunk_miss:
+        issue_codes.append("TARGET_FILE_HIT_BUT_CHUNK_MISS")
+    if abstain_expected and not abstain_correct:
+        issue_codes.append("ANSWERED_WHEN_SHOULD_ABSTAIN")
+
+    if abstain_expected:
+        error_type = "OK" if abstain_correct else "ANSWERED_WHEN_SHOULD_ABSTAIN"
+    elif bool(expected_info.get("has_unresolved")):
+        error_type = "EXPECTED_FILE_UNRESOLVED"
+    elif bool(expected_info.get("has_ambiguous")):
+        error_type = "EXPECTED_FILE_AMBIGUOUS"
+    elif candidate_hit is False:
+        error_type = "TARGET_FILE_MISS"
+    elif filtered_out:
+        error_type = "FILTERED_OUT"
+    elif target_file_hit_but_chunk_miss:
+        error_type = "TARGET_FILE_HIT_BUT_CHUNK_MISS"
+    elif context_hit is False:
+        error_type = "RERANK_DROP"
+    else:
+        error_type = "OK"
+
+    return {
+        "candidate_hit": candidate_hit,
+        "context_hit": context_hit,
+        "chunk_hit": chunk_hit,
+        "answer_hit": answer_hit,
+        "abstain_expected": abstain_expected,
+        "abstain_actual": abstain_actual,
+        "abstain_correct": abstain_correct,
+        "error_type": error_type,
+        "issue_codes": issue_codes,
+        "expected_file_resolution": expected_info,
+        "matched_candidate_files": matched_candidates,
+        "filtered_out": filtered_out,
+        "target_file_hit_but_chunk_miss": target_file_hit_but_chunk_miss,
+    }
+
+
+def _eval_run_summary_rows() -> list[list[Any]]:
+    return _eval_run_summary_rows_for_dataset(None)
+
+
+def _empty_eval_result_rows() -> list[list[Any]]:
+    return [[0, "（暂无结果）", "", "", "", "", "", "", "", ""]]
+
+
+def _empty_eval_summary_rows() -> list[list[Any]]:
+    return [["样本数", 0]]
+
+
+def _eval_case_bucket(case: dict[str, Any]) -> str:
+    expected_files = _resolve_expected_eval_files(case.get("expected_file_names") or [])
+    return "file_eval" if expected_files else "non_file_eval"
+
+
+def _summary_rows_from_summary(summary: dict[str, Any] | None) -> list[list[Any]]:
+    summary = summary or {}
+    return [
+        ["样本数", int(summary.get("case_count") or 0)],
+        ["文件命中可评估题", int(summary.get("file_eval_case_count") or 0)],
+        ["非文件命中题", int(summary.get("non_file_eval_case_count") or 0)],
+        ["候选命中率", summary.get("candidate_hit_rate") or "—"],
+        ["最终上下文命中率", summary.get("context_hit_rate") or "—"],
+        ["目标片段命中率", summary.get("chunk_hit_rate") or "—"],
+        ["答案命中率（参考）", summary.get("answer_hit_rate") or "—"],
+        ["拒答正确率（参考）", summary.get("abstain_accuracy") or "—"],
+        ["OK 数", int(summary.get("ok_count") or 0)],
+    ]
+
+
+def _eval_run_summary_rows_for_dataset(dataset_id: int | None) -> list[list[Any]]:
+    rows = store.list_eval_runs(limit=100)
+    if dataset_id is not None:
+        rows = [r for r in rows if int(r.get("dataset_id") or 0) == int(dataset_id)]
+    out: list[list[Any]] = []
+    for r in rows[:20]:
+        summary = r.get("summary") or {}
+        out.append(
+            [
+                int(r["id"]),
+                str(r.get("dataset_name") or ""),
+                str(r.get("name") or ""),
+                str(r.get("created_at") or ""),
+                int(summary.get("case_count") or 0),
+                int(summary.get("file_eval_case_count") or 0),
+                int(summary.get("non_file_eval_case_count") or 0),
+                summary.get("candidate_hit_rate") or "—",
+                summary.get("context_hit_rate") or "—",
+                summary.get("chunk_hit_rate") or "—",
+                summary.get("answer_hit_rate") or "—",
+                summary.get("abstain_accuracy") or "—",
+            ]
+        )
+    if not out:
+        out = [[0, "（暂无运行）", "", "", 0, 0, 0, "—", "—", "—", "—", "—"]]
+    return out
+
+
+def _empty_eval_param_rows() -> list[list[Any]]:
+    return [["参数", "值"], ["（暂无运行）", "—"]]
+
+
+def _empty_eval_error_rows() -> list[list[Any]]:
+    return [["错误类型", "数量", "占比"], ["（暂无结果）", 0, "—"]]
+
+
+def _empty_eval_tag_rows() -> list[list[Any]]:
+    return [["标签", "样本数", "文档命中率", "片段命中率", "答案命中率（参考）", "OK 数"], ["（暂无结果）", 0, "—", "—", "—", 0]]
+
+
+def _format_eval_rate_from_bools(values: list[bool | None]) -> str:
+    filtered = [bool(v) for v in values if v is not None]
+    if not filtered:
+        return "—"
+    return f"{(sum(1 for v in filtered if v) / len(filtered)) * 100:.1f}%"
+
+
+def _params_rows_from_run(run: dict[str, Any] | None) -> list[list[Any]]:
+    if not run:
+        return _empty_eval_param_rows()
+    params = run.get("params") or {}
+    ordered_keys = [
+        ("llm_model", "对话模型"),
+        ("embed_model", "嵌入模型"),
+        ("chunk_mode", "切分策略"),
+        ("chunk_size", "Chunk"),
+        ("chunk_overlap", "Overlap"),
+        ("top_n", "Top-N"),
+        ("top_k", "Top-K"),
+        ("use_rerank", "启用重排"),
+        ("query_anchoring_enabled", "查询锚点增强"),
+        ("query_anchoring_source", "锚点来源"),
+        ("llm_num_ctx", "LLM num_ctx"),
+        ("excluded_doc_classes", "排除分类"),
+        ("include_zero_chunk", "排除 zero-chunk"),
+        ("excluded_file_count", "排除文件数"),
+        ("excluded_file_preview", "排除文件预览"),
+        ("index_snapshot", "索引快照"),
+    ]
+    rows: list[list[Any]] = []
+    for key, label in ordered_keys:
+        val = params.get(key)
+        if key == "use_rerank":
+            val = "是" if bool(val) else "否"
+        elif key == "include_zero_chunk":
+            val = "是" if bool(val) else "否"
+        elif isinstance(val, list):
+            val = " / ".join(str(x) for x in val) or "—"
+        elif isinstance(val, dict):
+            val = json.dumps(val, ensure_ascii=False)
+        elif val in (None, ""):
+            val = "—"
+        rows.append([label, val])
+    return rows or _empty_eval_param_rows()
+
+
+def _eval_error_rows_for_run(run_id: int) -> list[list[Any]]:
+    results = store.fetch_eval_case_results(run_id)
+    if not results:
+        return _empty_eval_error_rows()
+    total = len(results)
+    counts: dict[str, int] = {}
+    for item in results:
+        key = str(item.get("error_type") or "UNKNOWN")
+        counts[key] = counts.get(key, 0) + 1
+    rows = []
+    for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        rows.append([key, count, f"{(count / total) * 100:.1f}%"])
+    return rows or _empty_eval_error_rows()
+
+
+def _eval_file_bucket_rows_for_run(run: dict[str, Any] | None) -> list[list[Any]]:
+    if not run:
+        return [["评测桶", "样本数", "候选命中率", "文档命中率", "片段命中率", "拒答正确率"], ["（暂无结果）", 0, "—", "—", "—", "—"]]
+    run_id = int(run.get("id") or 0)
+    dataset_id = int(run.get("dataset_id") or 0)
+    results = store.fetch_eval_case_results(run_id)
+    if not results or dataset_id <= 0:
+        return [["评测桶", "样本数", "候选命中率", "文档命中率", "片段命中率", "拒答正确率"], ["（暂无结果）", 0, "—", "—", "—", "—"]]
+    case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)}
+    bucket_map: dict[str, list[dict[str, Any]]] = {"file_eval": [], "non_file_eval": []}
+    for item in results:
+        case = case_map.get(int(item.get("case_id") or 0), {})
+        bucket_map.setdefault(_eval_case_bucket(case), []).append(item)
+
+    def _rate(items: list[dict[str, Any]], field: str) -> str:
+        vals = [bool(x[field]) for x in items if x.get(field) is not None]
+        if not vals:
+            return "—"
+        return f"{(sum(1 for v in vals if v) / len(vals)) * 100:.1f}%"
+
+    labels = {
+        "file_eval": "文件命中可评估",
+        "non_file_eval": "非文件命中题",
+    }
+    rows: list[list[Any]] = []
+    for key in ("file_eval", "non_file_eval"):
+        items = bucket_map.get(key) or []
+        rows.append([
+            labels[key],
+            len(items),
+            _rate(items, "candidate_hit"),
+            _rate(items, "context_hit"),
+            _rate(items, "chunk_hit"),
+            _rate(items, "abstain_correct"),
+        ])
+    return rows
+
+
+def _eval_tag_rows_for_run(run: dict[str, Any] | None) -> list[list[Any]]:
+    if not run:
+        return _empty_eval_tag_rows()
+    run_id = int(run.get("id") or 0)
+    dataset_id = int(run.get("dataset_id") or 0)
+    results = store.fetch_eval_case_results(run_id)
+    if not results or dataset_id <= 0:
+        return _empty_eval_tag_rows()
+    case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)}
+    bucket: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        case = case_map.get(int(item.get("case_id") or 0), {})
+        tags = list(case.get("tags") or []) or ["（未标注）"]
+        for tag in tags:
+            key = str(tag or "").strip() or "（未标注）"
+            bucket.setdefault(key, []).append(item)
+    rows: list[list[Any]] = []
+    for tag, items in sorted(bucket.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        rows.append(
+            [
+                tag,
+                len(items),
+                _format_eval_rate_from_bools([x.get("context_hit") for x in items]),
+                _format_eval_rate_from_bools([x.get("chunk_hit") for x in items]),
+                _format_eval_rate_from_bools([x.get("answer_hit") for x in items]),
+                sum(1 for x in items if str(x.get("error_type") or "") == "OK"),
+            ]
+        )
+    return rows or _empty_eval_tag_rows()
+
+
+def _eval_result_rows_for_run(run_id: int) -> list[list[Any]]:
+    results = store.fetch_eval_case_results(run_id)
+    rows: list[list[Any]] = []
+    for idx, item in enumerate(results, start=1):
+        sources = item.get("sources") or []
+        rows.append(
+            [
+                idx,
+                str(item.get("question") or ""),
+                "命中" if item.get("candidate_hit") else ("—" if item.get("candidate_hit") is None else "未命中"),
+                "命中" if item.get("context_hit") else ("—" if item.get("context_hit") is None else "未命中"),
+                "命中" if item.get("chunk_hit") else ("—" if item.get("chunk_hit") is None else "未命中"),
+                "命中" if item.get("answer_hit") else ("—" if item.get("answer_hit") is None else "未命中"),
+                "正确" if item.get("abstain_correct") else "错误",
+                str(item.get("error_type") or ""),
+                str((sources[0] or {}).get("file_name") or "—") if sources else "—",
+                item.get("qa_id") or "",
+            ]
+        )
+    return rows or _empty_eval_result_rows()
+
+
+def _eval_run_dashboard_outputs(dataset_id: int | None, run_id: int | None = None):
+    recent_rows = _eval_run_summary_rows_for_dataset(dataset_id)
+    if run_id is None:
+        return (
+            _empty_eval_summary_rows(),
+            recent_rows,
+            _empty_eval_result_rows(),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    run_rows = store.list_eval_runs(limit=200)
+    run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
+    summary_rows = _summary_rows_from_summary((run or {}).get("summary") or {})
+    result_rows = _eval_result_rows_for_run(run_id)
+    param_rows = _params_rows_from_run(run)
+    error_rows = _eval_error_rows_for_run(run_id)
+    tag_rows = _eval_tag_rows_for_run(run)
+    return summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows
+
+
+def _finalize_eval_run_summary(run_id: int) -> list[list[Any]]:
+    results = store.fetch_eval_case_results(run_id)
+    run_rows = store.list_eval_runs(limit=200)
+    run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
+    dataset_id = int((run or {}).get("dataset_id") or 0)
+    case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)} if dataset_id > 0 else {}
+    file_eval_results = [x for x in results if _eval_case_bucket(case_map.get(int(x.get("case_id") or 0), {})) == "file_eval"]
+    non_file_eval_results = [x for x in results if _eval_case_bucket(case_map.get(int(x.get("case_id") or 0), {})) != "file_eval"]
+
+    def _rate(field: str, items: list[dict[str, Any]] | None = None) -> str:
+        pool = items if items is not None else results
+        vals = [bool(x[field]) for x in pool if x.get(field) is not None]
+        if not vals:
+            return "—"
+        return f"{(sum(1 for v in vals if v) / len(vals)) * 100:.1f}%"
+
+    summary = {
+        "case_count": len(results),
+        "file_eval_case_count": len(file_eval_results),
+        "non_file_eval_case_count": len(non_file_eval_results),
+        "candidate_hit_rate": _rate("candidate_hit", file_eval_results),
+        "context_hit_rate": _rate("context_hit", file_eval_results),
+        "chunk_hit_rate": _rate("chunk_hit", file_eval_results),
+        "answer_hit_rate": _rate("answer_hit", results),
+        "abstain_accuracy": _rate("abstain_correct", results),
+        "ok_count": sum(1 for x in results if str(x.get("error_type") or "") == "OK"),
+    }
+    store.finish_eval_run(run_id, summary)
+    return _summary_rows_from_summary(summary)
+
+
+def _eval_run_id_from_select(evt: gr.SelectData) -> int | None:
+    if not getattr(evt, "selected", False):
+        return None
+    row_value = getattr(evt, "row_value", None)
+    if isinstance(row_value, (list, tuple)) and row_value:
+        try:
+            rid = int(str(row_value[0]).strip())
+            return rid if rid > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def do_run_eval_dataset(
+    dataset_choice: str | None,
+    run_name: str,
+    system_prompt: str,
+    top_n: int,
+    top_k: int,
+    use_rerank: bool,
+    chunk_size: int,
+    chunk_overlap: int,
+    chunk_mode: str,
+    llm_model: str,
+    llm_num_ctx: float,
+    embed_model: str,
+):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return "请先选择评测集。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
+    eng = _lazy_engine()
+    cases = store.fetch_eval_cases(dataset_id)
+    if not cases:
+        return "当前评测集没有样本。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
+    em = (embed_model or "").strip() or None
+    lm = (llm_model or "").strip() or None
+    cm = (chunk_mode or "sentence").strip().lower()
+    try:
+        nctx = int(round(float(llm_num_ctx)))
+    except (TypeError, ValueError):
+        nctx = 16384
+    nctx = max(2048, min(nctx, 262144))
+    top_n = max(1, int(top_n))
+    top_k = max(1, min(int(top_k), top_n))
+
+    index = eng.get_index(cfg, embed_model=em)
+    if index is None:
+        return "当前没有可用索引，请先构建知识库索引。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
+
+    params = eng.build_params_snapshot(
+        cfg,
+        int(chunk_size),
+        int(chunk_overlap),
+        top_n,
+        top_k,
+        bool(use_rerank),
+        chunk_mode=cm,
+        llm_model=lm,
+        embed_model=em,
+        llm_num_ctx=nctx,
+    )
+    index_state = _build_index_status_snapshot()
+    index_block_msg = _index_state_blocking_message(index_state)
+    if index_block_msg:
+        return (
+            index_block_msg,
+            [[0, "", "", "", "", "", "", "", "", ""]],
+            [["样本数", 0]],
+            _eval_run_summary_rows(),
+        )
+    title = str(run_name or "").strip() or f"评测运行 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    run_id = store.create_eval_run(dataset_id, title, params)
+    log_lines = [f"已创建评测运行：RUN#{run_id}，共 {len(cases)} 题。"]
+    result_rows: list[list[Any]] = []
+
+    for idx, case in enumerate(cases, start=1):
+        qtext = str(case.get("question") or "").strip()
+        log_lines.append(f"[{idx}/{len(cases)}] {qtext}")
+        nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
+        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
+        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
+        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+            cfg,
+            qtext,
+            nodes,
+            llm_model=lm,
+            llm_num_ctx=nctx,
+        )
+        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
+        diag_payload = _retrieval_diag_payload(
+            query=qtext,
+            vector_candidates=vector_diag,
+            final_sources=sources,
+            top_n=top_n,
+            top_k=top_k,
+            use_rerank=bool(use_rerank),
+            score_kind=kind,
+        )
+        diag_payload["context_selected_count"] = len(nodes_for_answer)
+        diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["index_state"] = dict(index_state)
+        diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
+        if not nodes_for_answer:
+            answer = (
+                "**根据已知材料无法回答。**\n\n"
+                "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
+            )
+        else:
+            parts: list[str] = []
+            for token in eng.stream_answer(
+                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
+            ):
+                parts.append(token)
+            answer = "".join(parts).strip() or "（模型未返回正文）"
+        judge = _evaluate_case_result(case, vector_diag, sources, answer)
+        diag_payload["eval_case_diagnostics"] = {
+            "issue_codes": list(judge.get("issue_codes") or []),
+            "expected_file_resolution": dict(judge.get("expected_file_resolution") or {}),
+            "matched_candidate_files": list(judge.get("matched_candidate_files") or []),
+            "filtered_out": bool(judge.get("filtered_out")),
+            "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
+            "candidate_hit": judge.get("candidate_hit"),
+            "context_hit": judge.get("context_hit"),
+            "chunk_hit": judge.get("chunk_hit"),
+            "answer_hit": judge.get("answer_hit"),
+            "abstain_expected": bool(judge.get("abstain_expected")),
+            "abstain_actual": bool(judge.get("abstain_actual")),
+            "abstain_correct": judge.get("abstain_correct"),
+            "error_type": str(judge.get("error_type") or ""),
+        }
+        qa_id = store.insert_qa(
+            question=qtext,
+            answer=answer,
+            sources=sources,
+            params=params,
+            diagnostics=diag_payload,
+            session_id=None,
+        )
+        store.save_eval_case_result(
+            run_id=run_id,
+            case_id=int(case["id"]),
+            question=qtext,
+            answer=answer,
+            sources=sources,
+            diagnostics=diag_payload,
+            candidate_hit=judge["candidate_hit"],
+            context_hit=judge["context_hit"],
+            chunk_hit=judge["chunk_hit"],
+            answer_hit=judge["answer_hit"],
+            abstain_expected=judge["abstain_expected"],
+            abstain_actual=judge["abstain_actual"],
+            abstain_correct=judge["abstain_correct"],
+            error_type=str(judge["error_type"] or ""),
+            qa_id=qa_id,
+        )
+        result_rows.append(
+            [
+                idx,
+                qtext,
+                "命中" if judge["candidate_hit"] else ("—" if judge["candidate_hit"] is None else "未命中"),
+                "命中" if judge["context_hit"] else ("—" if judge["context_hit"] is None else "未命中"),
+                "命中" if judge["chunk_hit"] else ("—" if judge["chunk_hit"] is None else "未命中"),
+                "命中" if judge["answer_hit"] else ("—" if judge["answer_hit"] is None else "未命中"),
+                "正确" if judge["abstain_correct"] else "错误",
+                str(judge["error_type"] or ""),
+                str(sources[0].get("file_name") or "—") if sources else "—",
+                qa_id,
+            ]
+        )
+        log_lines.append(
+            f"    候选 {len(nodes_vec)} 条，最终上下文 {len(nodes_for_answer)} 条，判定={judge['error_type']}，QA#{qa_id}"
+        )
+
+    if not result_rows:
+        result_rows = [[0, "（暂无结果）", "", "", "", "", "", "", "", ""]]
+    summary_rows = _finalize_eval_run_summary(run_id)
+    return "\n".join(log_lines), result_rows, summary_rows, _eval_run_summary_rows_for_dataset(dataset_id)
+
+
+def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
+    try:
+        cases = _parse_eval_cases_from_file(file_obj)
+    except Exception as e:
+        msg = f"导入失败：{type(e).__name__}: {e}"
+        if "openpyxl" in str(e).lower():
+            msg += "。当前环境缺少 Excel 依赖，请在项目 .venv 中重新安装 requirements.txt。"
+        choices, value = _eval_dataset_choices()
+        return (
+            msg,
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            "未导入评测集。",
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+        )
+    if not cases:
+        choices, value = _eval_dataset_choices()
+        return (
+            "导入失败：文件里没有有效样本，至少需要 question 字段。",
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            "未导入评测集。",
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+        )
+    name = str(dataset_name or "").strip()
+    if not name:
+        name = Path(getattr(file_obj, "name", file_obj)).stem
+    dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
+    choices, _ = _eval_dataset_choices()
+    choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
+    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    return (
+        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
+        gr.update(choices=choices, value=choice_value),
+        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
+        _eval_dataset_summary_markdown(dataset_id),
+        recent_rows,
+        result_rows,
+        summary_rows,
+    )
+
+
+def do_eval_dataset_select(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return (
+            "未选择评测集。",
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+        )
+    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    return (
+        _eval_dataset_summary_markdown(dataset_id),
+        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
+        recent_rows,
+        result_rows,
+        summary_rows,
+    )
+
+
+def do_eval_run_select(dataset_choice: str | None, evt: gr.SelectData):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    run_id = _eval_run_id_from_select(evt)
+    if run_id is None:
+        summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
+        return "未选中实验运行。", result_rows, summary_rows, recent_rows
+    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, run_id)
+    return f"已载入 RUN#{run_id} 的实验结果。", result_rows, summary_rows, recent_rows
+
+
+def do_eval_dashboard_refresh(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    if dataset_id is None:
+        return "未选择评测集。", recent_rows, result_rows, summary_rows
+    return f"已刷新评测集 #{dataset_id} 的实验面板。", recent_rows, result_rows, summary_rows
+
+
+def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
+    try:
+        cases = _parse_eval_cases_from_file(file_obj)
+    except Exception as e:
+        msg = f"导入失败：{type(e).__name__}: {e}"
+        if "openpyxl" in str(e).lower():
+            msg += "。当前环境缺少 Excel 依赖，请在项目 .venv 中重新安装 requirements.txt。"
+        choices, value = _eval_dataset_choices()
+        return (
+            msg,
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            "未导入评测集。",
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    if not cases:
+        choices, value = _eval_dataset_choices()
+        return (
+            "导入失败：文件里没有有效样本，至少需要 question 字段。",
+            gr.update(choices=choices, value=value),
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            "未导入评测集。",
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    name = str(dataset_name or "").strip()
+    if not name:
+        name = Path(getattr(file_obj, "name", file_obj)).stem
+    dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
+    choices, _ = _eval_dataset_choices()
+    choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    return (
+        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
+        gr.update(choices=choices, value=choice_value),
+        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
+        _eval_dataset_summary_markdown(dataset_id),
+        recent_rows,
+        result_rows,
+        summary_rows,
+        param_rows,
+        error_rows,
+        tag_rows,
+    )
+
+
+def do_eval_dataset_select(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return (
+            "未选择评测集。",
+            [[0, "（暂无样本）", "", "", "", "", "", ""]],
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    return (
+        _eval_dataset_summary_markdown(dataset_id),
+        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
+        recent_rows,
+        result_rows,
+        summary_rows,
+        param_rows,
+        error_rows,
+        tag_rows,
+    )
+
+
+def do_eval_run_select(dataset_choice: str | None, evt: gr.SelectData):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    run_id = _eval_run_id_from_select(evt)
+    if run_id is None:
+        summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+        return "未选中实验运行。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, run_id)
+    return f"已载入 RUN#{run_id} 的实验结果。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
+
+
+def do_eval_dashboard_refresh(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    if dataset_id is None:
+        return "未选择评测集。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows
+    return f"已刷新评测集 #{dataset_id} 的实验面板。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows
+
+
+def do_run_eval_dataset(
+    dataset_choice: str | None,
+    run_name: str,
+    system_prompt: str,
+    top_n: int,
+    top_k: int,
+    use_rerank: bool,
+    chunk_size: int,
+    chunk_overlap: int,
+    chunk_mode: str,
+    llm_model: str,
+    llm_num_ctx: float,
+    embed_model: str,
+):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return (
+            "请先选择评测集。",
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _eval_run_summary_rows_for_dataset(None),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    eng = _lazy_engine()
+    cases = store.fetch_eval_cases(dataset_id)
+    if not cases:
+        return (
+            "当前评测集没有样本。",
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _eval_run_summary_rows_for_dataset(dataset_id),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    em = (embed_model or "").strip() or None
+    lm = (llm_model or "").strip() or None
+    cm = (chunk_mode or "sentence").strip().lower()
+    try:
+        nctx = int(round(float(llm_num_ctx)))
+    except (TypeError, ValueError):
+        nctx = 16384
+    nctx = max(2048, min(nctx, 262144))
+    top_n = max(1, int(top_n))
+    top_k = max(1, min(int(top_k), top_n))
+
+    index = eng.get_index(cfg, embed_model=em)
+    if index is None:
+        return (
+            "当前没有可用索引，请先构建知识库索引。",
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _eval_run_summary_rows_for_dataset(dataset_id),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    exclusion_info = build_excluded_file_set(cfg, index=index, prefer_index=True)
+    excluded_files = list(exclusion_info.get("excluded_files") or [])
+    excluded_doc_classes = list(exclusion_info.get("excluded_doc_classes") or [])
+    include_zero_chunk = bool(exclusion_info.get("include_zero_chunk"))
+
+    params = eng.build_params_snapshot(
+        cfg,
+        int(chunk_size),
+        int(chunk_overlap),
+        top_n,
+        top_k,
+        bool(use_rerank),
+        chunk_mode=cm,
+        llm_model=lm,
+        embed_model=em,
+        llm_num_ctx=nctx,
+        excluded_files=excluded_files,
+        excluded_doc_classes=excluded_doc_classes,
+        include_zero_chunk=include_zero_chunk,
+        query_anchoring_enabled=True,
+        query_anchoring_source="expected_file_names",
+    )
+    index_state = _build_index_status_snapshot()
+    index_block_msg = _index_state_blocking_message(index_state)
+    if index_block_msg:
+        return (
+            index_block_msg,
+            _empty_eval_result_rows(),
+            _empty_eval_summary_rows(),
+            _eval_run_summary_rows_for_dataset(dataset_id),
+            _empty_eval_param_rows(),
+            _empty_eval_error_rows(),
+            _empty_eval_tag_rows(),
+        )
+    retrieval_only = str(lm or "").strip().lower() in {"[retrieval-only]", "retrieval-only", "retrieval_only"}
+    title = str(run_name or "").strip() or f"评测运行 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    run_id = store.create_eval_run(dataset_id, title, params)
+    log_lines = [f"已创建评测运行：RUN#{run_id}，共 {len(cases)} 题。"]
+    log_lines.append(
+        f"当前排除文件 {len(excluded_files)} 个，分类={('/'.join(excluded_doc_classes) or '—')}，含 zero-chunk={'是' if include_zero_chunk else '否'}。"
+    )
+    log_lines.append("当前启用 query anchoring：基于 expected_file_names 增强评测检索问题。")
+    if retrieval_only:
+        log_lines.append("当前运行为 retrieval-only：跳过 LLM 生成，只统计检索与上下文命中。")
+    result_rows: list[list[Any]] = []
+
+    for idx, case in enumerate(cases, start=1):
+        qtext = str(case.get("question") or "").strip()
+        retrieval_query, query_anchors = eng.build_anchored_eval_query(qtext, case.get("expected_file_names") or [])
+        log_lines.append(f"[{idx}/{len(cases)}] {qtext}")
+        nodes_vec = eng.vector_retrieve(cfg, index, retrieval_query, top_n)
+        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
+        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
+        nodes, kind = eng.apply_topk_rerank(cfg, retrieval_query, nodes_vec_filtered, top_k, bool(use_rerank))
+        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+            cfg,
+            qtext,
+            nodes,
+            llm_model=lm,
+            llm_num_ctx=nctx,
+        )
+        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
+        diag_payload = _retrieval_diag_payload(
+            query=retrieval_query,
+            raw_query=qtext,
+            query_anchors=query_anchors,
+            vector_candidates=vector_diag,
+            final_sources=sources,
+            top_n=top_n,
+            top_k=top_k,
+            use_rerank=bool(use_rerank),
+            score_kind=kind,
+            excluded_files=excluded_files,
+            excluded_doc_classes=excluded_doc_classes,
+            include_zero_chunk=include_zero_chunk,
+            excluded_candidate_count=excluded_candidate_count,
+        )
+        diag_payload["context_selected_count"] = len(nodes_for_answer)
+        diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["index_state"] = dict(index_state)
+        diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
+        if not nodes_for_answer:
+            answer = (
+                "**根据已知材料无法回答。**\n\n"
+                "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
+            )
+        elif retrieval_only:
+            answer = "[retrieval-only]"
+        else:
+            parts: list[str] = []
+            for token in eng.stream_answer(
+                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
+            ):
+                parts.append(token)
+            answer = "".join(parts).strip() or "（模型未返回正文）"
+        judge = _evaluate_case_result(case, vector_diag, sources, answer)
+        diag_payload["eval_case_diagnostics"] = {
+            "issue_codes": list(judge.get("issue_codes") or []),
+            "expected_file_resolution": dict(judge.get("expected_file_resolution") or {}),
+            "matched_candidate_files": list(judge.get("matched_candidate_files") or []),
+            "filtered_out": bool(judge.get("filtered_out")),
+            "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
+            "candidate_hit": judge.get("candidate_hit"),
+            "context_hit": judge.get("context_hit"),
+            "chunk_hit": judge.get("chunk_hit"),
+            "answer_hit": judge.get("answer_hit"),
+            "abstain_expected": bool(judge.get("abstain_expected")),
+            "abstain_actual": bool(judge.get("abstain_actual")),
+            "abstain_correct": judge.get("abstain_correct"),
+            "error_type": str(judge.get("error_type") or ""),
+        }
+        qa_id = store.insert_qa(
+            question=qtext,
+            answer=answer,
+            sources=sources,
+            params=params,
+            diagnostics=diag_payload,
+            session_id=None,
+        )
+        store.save_eval_case_result(
+            run_id=run_id,
+            case_id=int(case["id"]),
+            question=qtext,
+            answer=answer,
+            sources=sources,
+            diagnostics=diag_payload,
+            candidate_hit=judge["candidate_hit"],
+            context_hit=judge["context_hit"],
+            chunk_hit=judge["chunk_hit"],
+            answer_hit=judge["answer_hit"],
+            abstain_expected=judge["abstain_expected"],
+            abstain_actual=judge["abstain_actual"],
+            abstain_correct=judge["abstain_correct"],
+            error_type=str(judge["error_type"] or ""),
+            qa_id=qa_id,
+        )
+        result_rows.append(
+            [
+                idx,
+                qtext,
+                "命中" if judge["candidate_hit"] else ("—" if judge["candidate_hit"] is None else "未命中"),
+                "命中" if judge["context_hit"] else ("—" if judge["context_hit"] is None else "未命中"),
+                "命中" if judge["chunk_hit"] else ("—" if judge["chunk_hit"] is None else "未命中"),
+                "命中" if judge["answer_hit"] else ("—" if judge["answer_hit"] is None else "未命中"),
+                "正确" if judge["abstain_correct"] else "错误",
+                str(judge["error_type"] or ""),
+                str(sources[0].get("file_name") or "—") if sources else "—",
+                qa_id,
+            ]
+        )
+        log_lines.append(
+            f"    候选 {len(nodes_vec)} 条，过滤后 {len(nodes_vec_filtered)} 条，排除 {excluded_candidate_count} 条，最终上下文 {len(nodes)} 条，判定={judge['error_type']}，QA#{qa_id}"
+        )
+
+    if not result_rows:
+        result_rows = _empty_eval_result_rows()
+    summary_rows = _finalize_eval_run_summary(run_id)
+    recent_rows = _eval_run_summary_rows_for_dataset(dataset_id)
+    run_rows = store.list_eval_runs(limit=200)
+    run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
+    param_rows = _params_rows_from_run(run)
+    error_rows = _eval_error_rows_for_run(run_id)
+    tag_rows = _eval_tag_rows_for_run(run)
+    return "\n".join(log_lines), result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
 
 
 def build_ui():
@@ -2482,7 +4224,7 @@ def build_ui():
                                 ("按 Token 切分", "token"),
                                 ("段落优先（双换行再切）", "paragraph"),
                             ],
-                            value="sentence",
+                            value="paragraph",
                             label="切分策略",
                         )
                         chunk_size = gr.Slider(
@@ -2507,12 +4249,12 @@ def build_ui():
                             btn_chunk_diag = gr.Button("刷新切片统计", variant="secondary", size="sm")
                             chunk_diag_summary = gr.HTML(value=_chunk_diag_summary_html({"summary": {}}))
                             chunk_diag_df = gr.Dataframe(
-                                headers=["文件名", "块数", "平均字符", "最大字符", "空块", "图片提示块", "OCR 提示块", "视觉提示块"],
-                                value=[["（当前无切片统计）", 0, 0, 0, 0, 0, 0, 0]],
+                                headers=["文件名", "入库状态", "块数", "平均字符", "最大字符", "空块", "图片提示块", "OCR 提示块", "视觉提示块", "文档分类", "分类依据", "文本页/总页", "可疑页占比%"],
+                                value=[["（当前无切片统计）", "未知", 0, 0, 0, 0, 0, 0, 0, "—", "—", "0/0", 0]],
                                 show_label=False,
                                 interactive=False,
-                                static_columns=[0, 1, 2, 3, 4, 5, 6, 7],
-                                col_count=(8, "fixed"),
+                                static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                                col_count=(13, "fixed"),
                                 type="array",
                                 wrap=False,
                                 max_height=220,
@@ -2521,11 +4263,12 @@ def build_ui():
                 kb_files_df.select(_on_kb_file_select, outputs=kb_file_sel)
                 btn_preview_chunks.click(
                     _kb_chunk_preview_html,
-                    inputs=[kb_file_sel],
+                    inputs=[kb_file_sel, embed_dd],
                     outputs=[kb_chunk_preview],
                 )
                 btn_chunk_diag.click(
                     do_chunk_diagnostics,
+                    inputs=[embed_dd],
                     outputs=[chunk_diag_summary, chunk_diag_df],
                 )
 
@@ -2673,7 +4416,7 @@ def build_ui():
                         llm_num_ctx = gr.Number(
                             label="LLM 上下文窗口（num_ctx，Ollama）",
                             value=float(initial_llm_num_ctx_for_ui()),
-                            minimum=2048,
+                            minimum=1,
                             maximum=262144,
                             precision=0,
                             elem_classes=["rag-llm-num-ctx"],
@@ -2718,57 +4461,265 @@ def build_ui():
                             )
                             btn_rate = gr.Button("保存评分", variant="secondary", scale=0)
                         rate_status = gr.Textbox(label="状态", lines=1, max_lines=3)
-                    with gr.Accordion("批量问题回放", open=False):
-                        batch_title = gr.Textbox(
-                            label="回放会话标题",
-                            placeholder="可选：默认自动生成“批量回放 时间”",
+
+            with gr.Tab("评测", id="eval"):
+                eval_llm_choices, eval_emb_choices, eval_cur_llm, eval_cur_emb = refresh_model_choices()
+                eval_choices, eval_value = _eval_dataset_choices()
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5, min_width=420):
+                        gr.Markdown("##### 评测集")
+                        with gr.Row():
+                            eval_file = gr.File(
+                                label="导入评测集（json/csv/xlsx/xls）",
+                                file_count="single",
+                                file_types=[".json", ".csv", ".xlsx", ".xls"],
+                                type="filepath",
+                            )
+                            eval_dataset_name = gr.Textbox(
+                                label="评测集名称",
+                                placeholder="可选：默认取文件名",
+                            )
+                            eval_dataset_desc = gr.Textbox(
+                                label="说明",
+                                placeholder="可选：评测集用途或范围",
+                            )
+                            btn_eval_import = gr.Button("导入评测集", variant="secondary")
+                        eval_import_status = gr.Textbox(label="导入状态", lines=2, max_lines=4)
+                        eval_dataset_dd = gr.Dropdown(
+                            choices=eval_choices,
+                            value=eval_value,
+                            label="当前评测集",
+                            allow_custom_value=False,
                         )
-                        batch_questions = gr.Textbox(
-                            label="问题列表（每行一个）",
-                            lines=6,
-                            max_lines=12,
-                            placeholder="例如：\n本项目的目标是什么？\n图片增强支持哪些方式？",
+                        eval_dataset_summary = gr.Markdown(
+                            value=_eval_dataset_summary_markdown(_parse_eval_dataset_id(eval_value))
                         )
-                        btn_batch_replay = gr.Button("执行批量回放", variant="primary")
-                        batch_status = gr.Textbox(label="回放日志", lines=6, max_lines=12)
-                        batch_result_df = gr.Dataframe(
-                            headers=["问题", "检索结果", "候选数", "送入上下文", "首个来源文件", "QA ID"],
-                            value=[["（暂无结果）", "—", 0, 0, "—", "—"]],
+                        eval_cases_df = gr.Dataframe(
+                            headers=["#", "问题", "标准答案", "期望文件", "应命中片段", "答案关键词", "允许拒答", "标签"],
+                            value=_eval_cases_preview_rows(
+                                store.fetch_eval_cases(_parse_eval_dataset_id(eval_value))
+                                if _parse_eval_dataset_id(eval_value) is not None
+                                else []
+                            ),
                             show_label=False,
                             interactive=False,
-                            static_columns=[0, 1, 2, 3, 4, 5],
-                            col_count=(6, "fixed"),
-                            type="array",
-                            wrap=False,
-                            max_height=240,
-                        )
-                    with gr.Accordion("实验对比汇总", open=False):
-                        btn_compare = gr.Button("刷新实验对比", variant="secondary", size="sm")
-                        compare_df = gr.Dataframe(
-                            headers=[
-                                "嵌入模型",
-                                "LLM",
-                                "切分策略",
-                                "Chunk",
-                                "Overlap",
-                                "重排",
-                                "Top-N",
-                                "Top-K",
-                                "问答数",
-                                "已评分数",
-                                "平均分",
-                                "拒答/未命中数",
-                                "会话数",
-                            ],
-                            value=[["（暂无问答记录）", "", "", 0, 0, "否", 0, 0, 0, 0, "—", 0, 0]],
-                            show_label=False,
-                            interactive=False,
-                            static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-                            col_count=(13, "fixed"),
+                            static_columns=[0, 1, 2, 3, 4, 5, 6, 7],
+                            col_count=(8, "fixed"),
                             type="array",
                             wrap=False,
                             max_height=260,
                         )
+                    with gr.Column(scale=4, min_width=360):
+                        gr.Markdown("##### 实验运行")
+                        eval_run_name = gr.Textbox(
+                            label="运行名称",
+                            placeholder="可选：默认自动生成",
+                        )
+                        eval_system_prompt = gr.Textbox(
+                            value=str(cfg.prompt.get("system_default", "")).strip(),
+                            lines=5,
+                            label="System prompt",
+                        )
+                        with gr.Row():
+                            eval_llm_dd = gr.Dropdown(
+                                choices=eval_llm_choices,
+                                value=eval_cur_llm or (eval_llm_choices[0] if eval_llm_choices else ""),
+                                label="对话模型",
+                                allow_custom_value=True,
+                            )
+                            eval_embed_dd = gr.Dropdown(
+                                choices=eval_emb_choices,
+                                value=eval_cur_emb or (eval_emb_choices[0] if eval_emb_choices else ""),
+                                label="嵌入模型",
+                                allow_custom_value=True,
+                            )
+                        eval_llm_num_ctx = gr.Number(
+                            label="LLM 上下文窗口（num_ctx）",
+                            value=float(initial_llm_num_ctx_for_ui()),
+                            minimum=1,
+                            maximum=262144,
+                            precision=0,
+                        )
+                        with gr.Row():
+                            eval_top_n = gr.Slider(
+                                1,
+                                100,
+                                value=int(r.get("top_n_default", 20)),
+                                step=1,
+                                label="Top-N",
+                            )
+                            eval_top_k = gr.Slider(
+                                1,
+                                20,
+                                value=int(r.get("top_k_default", 3)),
+                                step=1,
+                                label="Top-K",
+                            )
+                        with gr.Row():
+                            eval_chunk_size = gr.Slider(
+                                128,
+                                2048,
+                                value=int(c.get("chunk_size_default", 512)),
+                                step=64,
+                                label="Chunk",
+                            )
+                            eval_chunk_overlap = gr.Slider(
+                                0,
+                                512,
+                                value=int(c.get("chunk_overlap_default", 64)),
+                                step=32,
+                                label="Overlap",
+                            )
+                        eval_chunk_mode = gr.Radio(
+                            choices=[
+                                ("按句切分", "sentence"),
+                                ("按 Token 切分", "token"),
+                                ("段落优先", "paragraph"),
+                            ],
+                            value="paragraph",
+                            label="切分策略",
+                        )
+                        eval_use_rerank = gr.Checkbox(
+                            value=bool(cfg.rerank.get("enabled_default", False)),
+                            label="启用 Cross-Encoder 重排",
+                        )
+                        btn_eval_run = gr.Button("执行评测", variant="primary")
+                        with gr.Accordion("运行日志", open=False):
+                            eval_run_status = gr.Textbox(label="运行日志", lines=8, max_lines=14)
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5, min_width=520):
+                        with gr.Row(equal_height=True):
+                            gr.Markdown("##### 实验面板")
+                            btn_eval_dashboard_refresh = gr.Button("刷新实验面板", variant="secondary", size="sm")
+                        with gr.Tabs():
+                            with gr.Tab("总览"):
+                                with gr.Row(equal_height=False):
+                                    with gr.Column(scale=2, min_width=220):
+                                        eval_run_summary_df = gr.Dataframe(
+                                            headers=["指标", "值"],
+                                            value=[["样本数", 0]],
+                                            show_label=False,
+                                            interactive=False,
+                                            static_columns=[0, 1],
+                                            col_count=(2, "fixed"),
+                                            type="array",
+                                            wrap=False,
+                                            max_height=220,
+                                        )
+                                    with gr.Column(scale=3, min_width=280):
+                                        eval_run_params_df = gr.Dataframe(
+                                            headers=["参数", "值"],
+                                            value=_empty_eval_param_rows(),
+                                            show_label=False,
+                                            interactive=False,
+                                            static_columns=[0, 1],
+                                            col_count=(2, "fixed"),
+                                            type="array",
+                                            wrap=False,
+                                            max_height=220,
+                                        )
+                                eval_recent_runs_df = gr.Dataframe(
+                                    headers=["RUN ID", "评测集", "运行名称", "创建时间", "样本数", "文件命中可评估题", "非文件命中题", "候选命中率", "文档命中率", "片段命中率", "答案命中率（参考）", "拒答正确率（参考）"],
+                                    value=_eval_run_summary_rows(),
+                                    show_label=False,
+                                    interactive=False,
+                                    static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                                    col_count=(12, "fixed"),
+                                    type="array",
+                                    wrap=False,
+                                    max_height=240,
+                                )
+                            with gr.Tab("结果明细"):
+                                eval_run_result_df = gr.Dataframe(
+                                    headers=["#", "问题", "候选命中", "文档命中", "片段命中", "答案命中（参考）", "拒答判定（参考）", "错误类型", "首个来源", "QA ID"],
+                                    value=[[0, "（暂无结果）", "", "", "", "", "", "", "", ""]],
+                                    show_label=False,
+                                    interactive=False,
+                                    static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                                    col_count=(10, "fixed"),
+                                    type="array",
+                                    wrap=False,
+                                    max_height=520,
+                                )
+                            with gr.Tab("诊断分析"):
+                                with gr.Row(equal_height=False):
+                                    with gr.Column(scale=2, min_width=220):
+                                        eval_error_df = gr.Dataframe(
+                                            headers=["错误类型", "数量", "占比"],
+                                            value=_empty_eval_error_rows(),
+                                            show_label=False,
+                                            interactive=False,
+                                            static_columns=[0, 1, 2],
+                                            col_count=(3, "fixed"),
+                                            type="array",
+                                            wrap=False,
+                                            max_height=240,
+                                        )
+                                    with gr.Column(scale=3, min_width=320):
+                                        eval_tag_df = gr.Dataframe(
+                                            headers=["标签", "样本数", "文档命中率", "片段命中率", "答案命中率（参考）", "OK 数"],
+                                            value=_empty_eval_tag_rows(),
+                                            show_label=False,
+                                            interactive=False,
+                                            static_columns=[0, 1, 2, 3, 4, 5],
+                                            col_count=(6, "fixed"),
+                                            type="array",
+                                            wrap=False,
+                                            max_height=320,
+                                        )
+                    with gr.Column(scale=2, min_width=320):
+                        gr.Markdown("##### 实验工具")
+                        with gr.Accordion("批量问题回放", open=False):
+                            batch_title = gr.Textbox(
+                                label="回放会话标题",
+                                placeholder="可选：默认自动生成批量回放时间",
+                            )
+                            batch_questions = gr.Textbox(
+                                label="问题列表（每行一个）",
+                                lines=6,
+                                max_lines=12,
+                                placeholder="例如\n本项目的目标是什么？\n图片增强支持哪些方式？",
+                            )
+                            btn_batch_replay = gr.Button("执行批量回放", variant="primary")
+                            batch_status = gr.Textbox(label="回放日志", lines=6, max_lines=12)
+                            batch_result_df = gr.Dataframe(
+                                headers=["问题", "检索结果", "候选数", "送入上下文", "首个来源文件", "QA ID"],
+                                value=[["（暂无结果）", "—", 0, 0, "—", "—"]],
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2, 3, 4, 5],
+                                col_count=(6, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=220,
+                            )
+                        with gr.Accordion("实验对比汇总", open=True):
+                            btn_compare = gr.Button("刷新实验对比", variant="secondary", size="sm")
+                            compare_df = gr.Dataframe(
+                                headers=[
+                                    "嵌入模型",
+                                    "LLM",
+                                    "切分策略",
+                                    "Chunk",
+                                    "Overlap",
+                                    "重排",
+                                    "Top-N",
+                                    "Top-K",
+                                    "问答数",
+                                    "已评分数",
+                                    "平均分",
+                                    "拒答/未命中数",
+                                    "会话数",
+                                ],
+                                value=[["（暂无问答记录）", "", "", 0, 0, "否", 0, 0, 0, 0, "—", 0, 0]],
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                                col_count=(13, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=260,
+                            )
 
                 _chat_inputs = [
                     msg,
@@ -2799,20 +4750,102 @@ def build_ui():
                     [
                         batch_questions,
                         batch_title,
-                        system_prompt,
-                        top_n,
-                        top_k,
-                        use_rerank,
-                        chunk_size,
-                        chunk_overlap,
-                        chunk_mode,
-                        llm_dd,
-                        llm_num_ctx,
-                        embed_dd,
+                        eval_system_prompt,
+                        eval_top_n,
+                        eval_top_k,
+                        eval_use_rerank,
+                        eval_chunk_size,
+                        eval_chunk_overlap,
+                        eval_chunk_mode,
+                        eval_llm_dd,
+                        eval_llm_num_ctx,
+                        eval_embed_dd,
                     ],
                     [batch_status, batch_result_df, session_table],
                 )
                 btn_compare.click(do_experiment_compare, outputs=[compare_df])
+                btn_eval_import.click(
+                    do_eval_dataset_import,
+                    [eval_file, eval_dataset_name, eval_dataset_desc],
+                    [
+                        eval_import_status,
+                        eval_dataset_dd,
+                        eval_cases_df,
+                        eval_dataset_summary,
+                        eval_recent_runs_df,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                    ],
+                )
+                eval_dataset_dd.change(
+                    do_eval_dataset_select,
+                    [eval_dataset_dd],
+                    [
+                        eval_dataset_summary,
+                        eval_cases_df,
+                        eval_recent_runs_df,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                    ],
+                )
+                btn_eval_run.click(
+                    do_run_eval_dataset,
+                    [
+                        eval_dataset_dd,
+                        eval_run_name,
+                        eval_system_prompt,
+                        eval_top_n,
+                        eval_top_k,
+                        eval_use_rerank,
+                        eval_chunk_size,
+                        eval_chunk_overlap,
+                        eval_chunk_mode,
+                        eval_llm_dd,
+                        eval_llm_num_ctx,
+                        eval_embed_dd,
+                    ],
+                    [
+                        eval_run_status,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_recent_runs_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                    ],
+                )
+                btn_eval_dashboard_refresh.click(
+                    do_eval_dashboard_refresh,
+                    [eval_dataset_dd],
+                    [
+                        eval_run_status,
+                        eval_recent_runs_df,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                    ],
+                )
+                eval_recent_runs_df.select(
+                    do_eval_run_select,
+                    [eval_dataset_dd],
+                    [
+                        eval_run_status,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_recent_runs_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                    ],
+                )
 
         demo.load(
             _on_app_load,

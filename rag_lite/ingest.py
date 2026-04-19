@@ -6,7 +6,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import subprocess
+import sys
 import time
+import uuid
 import unicodedata
 from collections.abc import Iterator
 from itertools import zip_longest
@@ -16,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
+from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
 from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 from llama_index.core.schema import MetadataMode
 from llama_index.core.utils import iter_batch
@@ -52,39 +57,632 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _chroma_versions_root(cfg: AppConfig) -> Path:
+    root = cfg.chroma_dir.parent / f"{cfg.chroma_dir.name}.__versions__"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _ensure_chroma_versions_root(cfg: AppConfig) -> Path:
+    root = _chroma_versions_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _versioned_chroma_dir(cfg: AppConfig, build_id: str) -> Path:
+    return _ensure_chroma_versions_root(cfg) / build_id
+
+
+def _load_index_manifest(cfg: AppConfig, store: Any = None) -> dict[str, Any] | None:
+    if store is not None:
+        try:
+            manifest = store.get_index_manifest()
+            if isinstance(manifest, dict):
+                return manifest
+        except Exception:
+            pass
+    try:
+        from rag_lite.store import ExperimentStore
+
+        manifest = ExperimentStore(cfg.sqlite_path).get_index_manifest()
+        if isinstance(manifest, dict):
+            return manifest
+    except Exception:
+        pass
+    return None
+
+
+def _manifest_active_chroma_dir(cfg: AppConfig, manifest: dict[str, Any] | None) -> Path | None:
+    if not isinstance(manifest, dict):
+        return None
+    subdir = str(manifest.get("active_chroma_subdir") or "").strip()
+    if not subdir:
+        return None
+    cand = Path(subdir)
+    if not cand.is_absolute():
+        cand = cfg.data_dir / cand
+    return cand if cand.is_dir() else None
+
+
+def resolve_active_chroma_dir(
+    cfg: AppConfig,
+    store: Any = None,
+    *,
+    allow_legacy: bool = True,
+) -> Path | None:
+    manifest = _load_index_manifest(cfg, store=store)
+    active = _manifest_active_chroma_dir(cfg, manifest)
+    if active is not None:
+        return active
+    if allow_legacy and cfg.chroma_dir.is_dir():
+        return cfg.chroma_dir
+    return None
+
+
+def active_chroma_label(cfg: AppConfig, store: Any = None) -> str:
+    active = resolve_active_chroma_dir(cfg, store=store)
+    if active is None:
+        return "（未发现可用索引目录）"
+    try:
+        return str(active.resolve())
+    except Exception:
+        return str(active)
+
+
 def _temp_chroma_dir(cfg: AppConfig) -> Path:
     parent = cfg.chroma_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
     return parent / f"{cfg.chroma_dir.name}.__building__.{os.getpid()}.{time.time_ns()}"
 
 
-def _activate_built_chroma_dir(cfg: AppConfig, built_dir: Path) -> None:
-    final_dir = cfg.chroma_dir
-    backup_dir = final_dir.parent / f"{final_dir.name}.__backup__.{os.getpid()}.{time.time_ns()}"
-    had_old = final_dir.exists()
+def _new_build_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+
+def _manifest_subdir_for_chroma_dir(cfg: AppConfig, chroma_dir: Path) -> str | None:
+    try:
+        resolved = chroma_dir.resolve()
+        data_root = cfg.data_dir.resolve()
+        try:
+            return str(resolved.relative_to(data_root)).replace("\\", "/")
+        except Exception:
+            return str(resolved)
+    except Exception:
+        return None
+
+
+def _build_compatible_collection_config_json(
+    chroma_dir: Path,
+    collection_name: str,
+) -> str | None:
+    """为 Chroma 1.5.x 补齐 collections.config_json_str，兼容旧版/空配置。"""
+    try:
+        from chromadb.api.configuration import CollectionConfigurationInternal
+    except Exception:
+        return None
+
+    db = chroma_dir / "chroma.sqlite3"
+    if not db.is_file():
+        return None
+
+    try:
+        cfg_json = CollectionConfigurationInternal().to_json()
+    except Exception:
+        return None
+
+    try:
+        con = sqlite3.connect(str(db))
+        cur = con.cursor()
+        row = cur.execute(
+            "select id, schema_str from collections where name = ? limit 1",
+            (collection_name,),
+        ).fetchone()
+        if not row:
+            con.close()
+            return json.dumps(cfg_json, ensure_ascii=False)
+        coll_id, schema_str = row
+        meta_rows = cur.execute(
+            "select key, str_value, int_value, float_value, bool_value from collection_metadata where collection_id = ?",
+            (coll_id,),
+        ).fetchall()
+        con.close()
+    except Exception:
+        return json.dumps(cfg_json, ensure_ascii=False)
+
+    try:
+        hnsw_cfg = cfg_json.get("hnsw_configuration") or {}
+        if isinstance(schema_str, str) and schema_str.strip():
+            schema = json.loads(schema_str)
+            hnsw = (
+                (((schema.get("defaults") or {}).get("float_list") or {}).get("vector_index") or {}).get("config") or {}
+            ).get("hnsw") or {}
+            if isinstance(hnsw, dict):
+                if "space" in hnsw:
+                    hnsw_cfg["space"] = hnsw.get("space") or hnsw_cfg.get("space")
+                if "ef_construction" in hnsw:
+                    hnsw_cfg["ef_construction"] = int(hnsw.get("ef_construction") or hnsw_cfg.get("ef_construction") or 100)
+                if "ef_search" in hnsw:
+                    hnsw_cfg["ef_search"] = int(hnsw.get("ef_search") or hnsw_cfg.get("ef_search") or 100)
+                if "num_threads" in hnsw:
+                    hnsw_cfg["num_threads"] = int(hnsw.get("num_threads") or hnsw_cfg.get("num_threads") or 12)
+                if "resize_factor" in hnsw:
+                    hnsw_cfg["resize_factor"] = float(hnsw.get("resize_factor") or hnsw_cfg.get("resize_factor") or 1.2)
+                if "max_neighbors" in hnsw:
+                    hnsw_cfg["M"] = int(hnsw.get("max_neighbors") or hnsw_cfg.get("M") or 16)
+                if "batch_size" in hnsw:
+                    hnsw_cfg["batch_size"] = int(hnsw.get("batch_size") or hnsw_cfg.get("batch_size") or 100)
+                if "sync_threshold" in hnsw:
+                    hnsw_cfg["sync_threshold"] = int(hnsw.get("sync_threshold") or hnsw_cfg.get("sync_threshold") or 1000)
+        for key, str_value, int_value, float_value, bool_value in meta_rows:
+            if key == "hnsw:batch_size":
+                hnsw_cfg["batch_size"] = int(int_value or float_value or str_value or hnsw_cfg.get("batch_size") or 100)
+            elif key == "hnsw:sync_threshold":
+                hnsw_cfg["sync_threshold"] = int(int_value or float_value or str_value or hnsw_cfg.get("sync_threshold") or 1000)
+        cfg_json["hnsw_configuration"] = hnsw_cfg
+    except Exception:
+        pass
+    return json.dumps(cfg_json, ensure_ascii=False)
+
+
+def _repair_chroma_collection_config_if_needed(chroma_dir: Path, collection_name: str) -> bool:
+    db = chroma_dir / "chroma.sqlite3"
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(str(db))
+        cur = con.cursor()
+        row = cur.execute(
+            "select config_json_str from collections where name = ? limit 1",
+            (collection_name,),
+        ).fetchone()
+        if not row:
+            con.close()
+            return False
+        raw = row[0]
+        needs_repair = False
+        if raw is None:
+            needs_repair = True
+        else:
+            try:
+                obj = json.loads(str(raw).strip() or "{}")
+                needs_repair = not (isinstance(obj, dict) and obj.get("_type"))
+            except Exception:
+                needs_repair = True
+        if not needs_repair:
+            con.close()
+            return False
+        new_raw = _build_compatible_collection_config_json(chroma_dir, collection_name)
+        if not new_raw:
+            con.close()
+            return False
+        cur.execute(
+            "update collections set config_json_str = ? where name = ?",
+            (new_raw, collection_name),
+        )
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _open_chroma_collection_for_dir(chroma_dir: Path, collection_name: str) -> Any | None:
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+
+    if not chroma_dir.is_dir():
+        return None
     last_exc: Exception | None = None
+    repaired = False
+    for attempt in range(4):
+        try:
+            client = chromadb.PersistentClient(
+                path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+            return client.get_collection(collection_name)
+        except Exception as e:
+            last_exc = e
+            msg = str(e or "").strip().lower()
+            if (not repaired) and ("keyerror: '_type'" in msg or '"_type"' in msg or "'_type'" in msg):
+                repaired = _repair_chroma_collection_config_if_needed(chroma_dir, collection_name)
+            _clear_chroma_process_cache()
+            time.sleep(0.25 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+def _activate_built_chroma_dir(cfg: AppConfig, built_dir: Path, build_id: str) -> Path:
+    final_dir = _versioned_chroma_dir(cfg, build_id)
+    last_exc: Exception | None = None
+    _clear_chroma_process_cache()
     for attempt in range(6):
         try:
-            if had_old and final_dir.exists():
-                shutil.move(str(final_dir), str(backup_dir))
+            if final_dir.exists():
+                shutil.rmtree(final_dir, ignore_errors=True)
+            final_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(built_dir), str(final_dir))
             last_exc = None
             break
         except Exception as e:
             last_exc = e
-            if had_old and backup_dir.exists() and not final_dir.exists():
-                shutil.move(str(backup_dir), str(final_dir))
             time.sleep(0.2 * (attempt + 1))
     if last_exc is not None:
         raise last_exc
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir, ignore_errors=True)
+    _clear_chroma_process_cache()
+    return final_dir
 
 
 def _close_chroma_client(client: Any) -> None:
     close = getattr(client, "close", None)
     if callable(close):
         close()
+
+
+def _sqlite_embedding_count(chroma_dir: Path) -> int:
+    db = chroma_dir / "chroma.sqlite3"
+    if not db.is_file():
+        return 0
+    con = sqlite3.connect(str(db))
+    try:
+        cur = con.cursor()
+        row = cur.execute("select count(*) from embeddings").fetchone()
+        return int((row or [0])[0] or 0)
+    finally:
+        con.close()
+
+
+def _wait_for_chroma_sqlite_embeddings(
+    chroma_dir: Path,
+    expected_count: int,
+    *,
+    attempts: int = 40,
+    sleep_s: float = 0.5,
+) -> tuple[bool, int]:
+    last = 0
+    for _ in range(max(1, attempts)):
+        try:
+            last = _sqlite_embedding_count(chroma_dir)
+        except Exception:
+            last = 0
+        if last >= expected_count:
+            return True, last
+        time.sleep(max(0.0, sleep_s))
+    return False, last
+
+
+def _wait_for_chroma_indexing_complete(
+    chroma_collection: Any,
+    *,
+    attempts: int = 80,
+    sleep_s: float = 0.25,
+) -> tuple[bool, dict[str, int]]:
+    last = {
+        "num_indexed_ops": 0,
+        "num_unindexed_ops": 0,
+        "total_ops": 0,
+    }
+    for _ in range(max(1, attempts)):
+        try:
+            status = chroma_collection.get_indexing_status()
+            last = {
+                "num_indexed_ops": int(getattr(status, "num_indexed_ops", 0) or 0),
+                "num_unindexed_ops": int(getattr(status, "num_unindexed_ops", 0) or 0),
+                "total_ops": int(getattr(status, "total_ops", 0) or 0),
+            }
+            if last["total_ops"] > 0 and last["num_unindexed_ops"] == 0:
+                return True, last
+        except Exception:
+            pass
+        time.sleep(max(0.0, sleep_s))
+    return False, last
+
+
+def _chroma_hnsw_artifact_files(chroma_dir: Path) -> list[Path]:
+    if not chroma_dir.is_dir():
+        return []
+    names = {
+        "index_metadata.pickle",
+        "header.bin",
+        "data_level0.bin",
+        "length.bin",
+        "link_lists.bin",
+    }
+    try:
+        return sorted(p for p in chroma_dir.rglob("*") if p.is_file() and p.name in names)
+    except Exception:
+        return []
+
+
+def _has_complete_hnsw_artifacts(paths: list[Path]) -> bool:
+    names = {p.name for p in (paths or [])}
+    required = {
+        "index_metadata.pickle",
+        "header.bin",
+        "data_level0.bin",
+        "length.bin",
+        "link_lists.bin",
+    }
+    return required.issubset(names)
+
+
+def _wait_for_chroma_hnsw_artifacts(
+    chroma_dir: Path,
+    *,
+    attempts: int = 40,
+    sleep_s: float = 0.5,
+) -> tuple[bool, list[Path]]:
+    last: list[Path] = []
+    for _ in range(max(1, attempts)):
+        try:
+            last = _chroma_hnsw_artifact_files(chroma_dir)
+        except Exception:
+            last = []
+        if _has_complete_hnsw_artifacts(last):
+            return True, last
+        time.sleep(max(0.0, sleep_s))
+    return False, last
+
+
+def _run_self_check_until_ready(
+    cfg: AppConfig,
+    *,
+    embed_model_override: str | None = None,
+    chroma_dir_override: Path | None = None,
+    require_query: bool,
+    attempts: int,
+    sleep_s: float,
+) -> dict[str, Any]:
+    last: dict[str, Any] = {
+        "ok": False,
+        "count_ok": False,
+        "get_ok": False,
+        "query_ok": False,
+        "count": 0,
+        "sample_id": "",
+        "sample_query": "",
+        "diagnostics_total_chunks": 0,
+        "diagnostics_total_files": 0,
+        "missing_uploaded_files": [],
+        "top_files": [],
+        "error": "self-check not started",
+    }
+    for i in range(max(1, attempts)):
+        _clear_chroma_process_cache()
+        last = _run_self_check_in_subprocess(
+            cfg,
+            embed_model_override=embed_model_override,
+            chroma_dir_override=chroma_dir_override,
+            require_query=require_query,
+        )
+        if bool(last.get("ok")):
+            return last
+        if i + 1 < attempts:
+            time.sleep(max(0.0, sleep_s))
+    return last
+
+
+def _is_transient_chroma_reopen_error(err: Any) -> bool:
+    s = str(err or "").strip().lower()
+    if not s:
+        return False
+    # 仅对 metadata/config schema 兼容性问题做兜底；
+    # HNSW 打不开（如 Cannot open header file）必须视为不可查询，不能再激活为正式索引。
+    needles = (
+        "keyerror: '_type'",
+    )
+    return any(x in s for x in needles)
+
+
+def _release_chroma_runtime(*objs: Any, clear_process_cache: bool = True) -> None:
+    for obj in objs:
+        try:
+            close = getattr(obj, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+    gc.collect()
+    if clear_process_cache:
+        _clear_chroma_process_cache()
+
+
+def _finalize_temp_chroma_build(
+    chroma_dir: Path,
+    chroma_collection: Any,
+    chroma_client: Any,
+    *,
+    expected_count: int,
+) -> tuple[bool, dict[str, Any]]:
+    indexing_ok, indexing_status = _wait_for_chroma_indexing_complete(
+        chroma_collection,
+        attempts=120,
+        sleep_s=0.25,
+    )
+    _release_chroma_runtime(chroma_collection, chroma_client, clear_process_cache=False)
+    _clear_chroma_process_cache()
+    persisted_ok, persisted_count = _wait_for_chroma_sqlite_embeddings(
+        chroma_dir,
+        expected_count,
+        attempts=60,
+        sleep_s=0.5,
+    )
+    hnsw_ok, hnsw_files = _wait_for_chroma_hnsw_artifacts(
+        chroma_dir,
+        attempts=60,
+        sleep_s=0.5,
+    )
+    # NOTE:
+    # Chroma 1.x 在不同版本/平台下，HNSW 持久化文件形态可能不再固定为
+    # {index_metadata.pickle, header.bin, data_level0.bin, length.bin, link_lists.bin} 全套。
+    # 这里仅把 hnsw 文件集合作为诊断信息；是否可用交给后续「重开自检（count/get/query）」兜底。
+    return (
+        persisted_ok,
+        {
+            "indexing_ok": indexing_ok,
+            "indexing_status": indexing_status,
+            "persisted_ok": persisted_ok,
+            "persisted_count": persisted_count,
+            "hnsw_ok": hnsw_ok,
+            "hnsw_files": hnsw_files,
+        },
+    )
+
+
+def _project_python_executable(cfg: AppConfig) -> str:
+    """Use the project .venv interpreter for all ragZone subprocesses."""
+    root = Path(cfg.root)
+    candidates = [
+        root / ".venv" / "Scripts" / "python.exe",
+        root / ".venv" / "bin" / "python",
+    ]
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand)
+        except Exception:
+            pass
+    return sys.executable
+
+
+
+def _run_self_check_in_subprocess(
+    cfg: AppConfig,
+    *,
+    embed_model_override: str | None = None,
+    chroma_dir_override: Path | None = None,
+    require_query: bool = True,
+) -> dict[str, Any]:
+    payload = {
+        "project_root": str(cfg.root),
+        "embed_model_override": embed_model_override,
+        "chroma_dir_override": str(chroma_dir_override) if chroma_dir_override is not None else None,
+        "require_query": bool(require_query),
+    }
+    code = """
+import json, sys
+from pathlib import Path
+payload = json.loads(sys.argv[1])
+proj = Path(payload['project_root'])
+sys.path.insert(0, str(proj))
+from rag_lite.config import load_config
+from rag_lite.ingest import self_check_index
+cfg = load_config(proj)
+chroma_dir = Path(payload['chroma_dir_override']) if payload.get('chroma_dir_override') else None
+res = self_check_index(
+    cfg,
+    embed_model_override=payload.get('embed_model_override'),
+    chroma_dir_override=chroma_dir,
+    require_query=bool(payload.get('require_query', True)),
+)
+print(json.dumps(res, ensure_ascii=False))
+"""
+    try:
+        r = subprocess.run(
+            [_project_python_executable(cfg), "-c", code, json.dumps(payload, ensure_ascii=False)],
+            capture_output=True,
+            text=False,
+            timeout=180,
+            check=False,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "count_ok": False,
+            "get_ok": False,
+            "query_ok": False,
+            "count": 0,
+            "sample_id": "",
+            "sample_query": "",
+            "diagnostics_total_chunks": 0,
+            "diagnostics_total_files": 0,
+            "missing_uploaded_files": [],
+            "top_files": [],
+            "error": f"subprocess self-check failed: {type(e).__name__}: {e}",
+        }
+    stdout = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (r.stderr or b"").decode("utf-8", errors="replace").strip()
+    if r.returncode != 0:
+        return {
+            "ok": False,
+            "count_ok": False,
+            "get_ok": False,
+            "query_ok": False,
+            "count": 0,
+            "sample_id": "",
+            "sample_query": "",
+            "diagnostics_total_chunks": 0,
+            "diagnostics_total_files": 0,
+            "missing_uploaded_files": [],
+            "top_files": [],
+            "error": f"subprocess returncode={r.returncode}: {stderr or stdout or 'unknown error'}",
+        }
+    if not stdout:
+        return {
+            "ok": False,
+            "count_ok": False,
+            "get_ok": False,
+            "query_ok": False,
+            "count": 0,
+            "sample_id": "",
+            "sample_query": "",
+            "diagnostics_total_chunks": 0,
+            "diagnostics_total_files": 0,
+            "missing_uploaded_files": [],
+            "top_files": [],
+            "error": "subprocess self-check returned empty stdout",
+        }
+    try:
+        return json.loads(stdout.splitlines()[-1])
+    except Exception as e:
+        return {
+            "ok": False,
+            "count_ok": False,
+            "get_ok": False,
+            "query_ok": False,
+            "count": 0,
+            "sample_id": "",
+            "sample_query": "",
+            "diagnostics_total_chunks": 0,
+            "diagnostics_total_files": 0,
+            "missing_uploaded_files": [],
+            "top_files": [],
+            "error": f"subprocess self-check parse failed: {type(e).__name__}: {e}; raw={stdout[-500:]}",
+        }
+
+
+def _clear_chroma_process_cache() -> None:
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+        systems = list(getattr(SharedSystemClient, "_identifier_to_system", {}).items())
+        for identifier, system in systems:
+            try:
+                system.stop()
+            except Exception:
+                pass
+            try:
+                SharedSystemClient._identifier_to_system.pop(identifier, None)
+            except Exception:
+                pass
+            try:
+                SharedSystemClient._identifier_to_refcount.pop(identifier, None)
+            except Exception:
+                pass
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _chroma_count_index_only(coll: Any) -> int:
+    """Prefer compacted-index count so readiness isn't overstated by WAL-visible rows."""
+    try:
+        from chromadb.api.types import ReadLevel
+
+        return int(coll.count(read_level=ReadLevel.INDEX_ONLY))
+    except Exception:
+        return int(coll.count())
 
 
 def _node_file_name(node: Any) -> str:
@@ -288,11 +886,11 @@ def iter_build_index(
     splitter = _make_node_splitter(chunk_mode, chunk_size, chunk_overlap)
     nodes = splitter.get_nodes_from_documents(docs)
     content_nodes = [
-        n for n in nodes if n.get_content(metadata_mode=MetadataMode.EMBED) != ""
+        n for n in nodes if str(n.get_content(metadata_mode=MetadataMode.NONE) or "").strip()
     ]
     skipped = len(nodes) - len(content_nodes)
     if skipped:
-        yield f"    └ 提示：跳过 {skipped} 个无嵌入内容的空块。"
+        yield f"    └ 提示：跳过 {skipped} 个无正文的空块。"
     n_total = len(content_nodes)
     if n_total == 0:
         yield "失败：没有可写入向量的文本块。"
@@ -301,6 +899,7 @@ def iter_build_index(
     import chromadb
     from chromadb.config import Settings as ChromaSettings
 
+    build_id = _new_build_id()
     temp_chroma_dir = _temp_chroma_dir(cfg)
     try:
         temp_chroma_dir.mkdir(parents=True, exist_ok=False)
@@ -313,7 +912,26 @@ def iter_build_index(
         path=str(temp_chroma_dir),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
-    chroma_collection = chroma_client.get_or_create_collection(cfg.collection_name)
+    # Windows + Chroma 1.5.x 下，过大的 HNSW batch/sync 阈值会触发巨量内存分配，
+    # 表面上 SQLite embeddings 已写入，实际 HNSW 文件却落不全，随后 query 会报
+    # Cannot open header file。这里默认使用保守值，并保证 sync_threshold >= batch_size。
+    hnsw_batch_size = max(1, int(cfg.ingest.get("chroma_hnsw_batch_size") or 100))
+    hnsw_sync_threshold = max(
+        hnsw_batch_size,
+        int(cfg.ingest.get("chroma_hnsw_sync_threshold") or 1000),
+    )
+    chroma_collection = chroma_client.get_or_create_collection(
+        cfg.collection_name,
+        metadata={
+            "hnsw:batch_size": max(1, hnsw_batch_size),
+            "hnsw:sync_threshold": max(1, hnsw_sync_threshold),
+        },
+    )
+    yield (
+        "    └ Chroma 可靠模式："
+        f"hnsw_batch_size={max(1, hnsw_batch_size)}，"
+        f"hnsw_sync_threshold={max(1, hnsw_sync_threshold)}"
+    )
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
@@ -345,21 +963,143 @@ def iter_build_index(
         yield f"失败：向量化或写入 Chroma 时出错：{e}"
         return
 
-    yield "    └ 新索引构建完成，正在替换旧索引 …"
-    _close_chroma_client(chroma_client)
-    del index, vector_store, storage_context, chroma_collection, chroma_client
-    gc.collect()
-    try:
-        _activate_built_chroma_dir(cfg, temp_chroma_dir)
-    except Exception as e:
+    _release_chroma_runtime(index, vector_store, storage_context, clear_process_cache=False)
+
+    yield "    └ 正在等待 Chroma 完成索引落盘 …"
+    finalized_ok, finalize_state = _finalize_temp_chroma_build(
+        temp_chroma_dir,
+        chroma_collection,
+        chroma_client,
+        expected_count=n_total,
+    )
+    indexing_ok = bool(finalize_state.get("indexing_ok"))
+    indexing_status = finalize_state.get("indexing_status") or {}
+    persisted_ok = bool(finalize_state.get("persisted_ok"))
+    persisted_count = int(finalize_state.get("persisted_count") or 0)
+    hnsw_ok = bool(finalize_state.get("hnsw_ok"))
+    hnsw_files = list(finalize_state.get("hnsw_files") or [])
+    indexing_total = int(indexing_status.get("total_ops") or 0)
+    indexing_unindexed = int(indexing_status.get("num_unindexed_ops") or 0)
+    if not finalized_ok:
         shutil.rmtree(temp_chroma_dir, ignore_errors=True)
-        yield f"失败：新索引已构建，但替换旧索引时出错：{e}"
+        yield (
+            "失败：临时索引最终持久化检查未通过（SQLite embeddings 未达到期望值），已终止替换。"
+            f" indexing_total={indexing_total}；"
+            f"unindexed={indexing_unindexed}；"
+            f"SQLite embeddings={persisted_count}/{n_total}；"
+            f"hnsw_artifacts={len(hnsw_files)}"
+        )
         return
 
+    yield "    └ 正在执行临时索引重开自检（count / get / diagnostics）…"
+    temp_health = _run_self_check_until_ready(
+        cfg,
+        embed_model_override=em_name,
+        chroma_dir_override=temp_chroma_dir,
+        require_query=False,
+        attempts=18,
+        sleep_s=1.0,
+    )
+    temp_reopen_health = _run_self_check_until_ready(
+        cfg,
+        embed_model_override=em_name,
+        chroma_dir_override=temp_chroma_dir,
+        require_query=True,
+        attempts=8,
+        sleep_s=1.0,
+    )
+    if not bool(temp_reopen_health.get("ok")):
+        shutil.rmtree(temp_chroma_dir, ignore_errors=True)
+        yield (
+            "失败：临时索引重开自检未通过，已终止替换。"
+            f" indexing_total={indexing_total}；"
+            f"unindexed={indexing_unindexed}；"
+            f"SQLite embeddings={persisted_count}/{n_total}；"
+            f"hnsw_artifacts={len(hnsw_files)}；"
+            f"count={int((temp_reopen_health or {}).get('count') or 0)}/{n_total}；"
+            f"diag_chunks={int((temp_health or {}).get('diagnostics_total_chunks') or 0)}；"
+            f"diag_files={int((temp_health or {}).get('diagnostics_total_files') or 0)}；"
+            f"missing={len((temp_health or {}).get('missing_uploaded_files') or [])}；"
+            f"错误={(temp_reopen_health or {}).get('error') or '无'}"
+        )
+        return
+
+    yield (
+        "    └ 临时索引重开自检通过："
+        f"indexing_total={indexing_total}；"
+        f"unindexed={indexing_unindexed}；"
+        f"SQLite embeddings={persisted_count}/{n_total}；"
+        f"hnsw_artifacts={len(hnsw_files)}；"
+        f"count={int(temp_reopen_health.get('count') or 0)}；"
+        f"diag_chunks={int(temp_reopen_health.get('diagnostics_total_chunks') or 0)}；"
+        f"diag_files={int(temp_reopen_health.get('diagnostics_total_files') or 0)}；"
+        f"sample_id={temp_reopen_health.get('sample_id') or '—'}"
+    )
+
+    yield "    └ 新索引构建完成，正在激活新版本索引 …"
+    try:
+        active_dir = _activate_built_chroma_dir(cfg, temp_chroma_dir, build_id)
+    except Exception as e:
+        shutil.rmtree(temp_chroma_dir, ignore_errors=True)
+        yield f"失败：新索引已构建，但激活新版本时出错：{e}"
+        return
+
+    yield "    └ 正在执行索引健康自检（count / get / query）…"
+    health = _run_self_check_until_ready(
+        cfg,
+        embed_model_override=em_name,
+        chroma_dir_override=active_dir,
+        require_query=True,
+        attempts=18,
+        sleep_s=1.0,
+    )
+    if not bool((health or {}).get("ok")):
+        _clear_chroma_process_cache()
+        live_sqlite_count = 0
+        try:
+            live_sqlite_count = _sqlite_embedding_count(active_dir)
+        except Exception:
+            live_sqlite_count = 0
+        shutil.rmtree(active_dir, ignore_errors=True)
+        yield (
+            "失败：新索引版本激活后健康自检未通过，已丢弃该版本。"
+            f" 自检错误：{(health or {}).get('error') or '未知错误'}"
+            f"；live SQLite embeddings={live_sqlite_count}"
+        )
+        return
+    yield (
+        f"    └ 自检通过：count={int(health.get('count') or 0)}；"
+        f"sample_id={health.get('sample_id') or '—'}"
+    )
+
     snap = uploaded_files_snapshot(cfg)
+    doc_manifest_meta = _collect_doc_manifest_rows(docs)
     built_iso = _utc_now_iso()
     for item in snap:
         item["indexed_at"] = built_iso
+        extra = doc_manifest_meta.get(_filename_sig(str(item.get("name") or ""))) or {}
+        if extra:
+            item.update(extra)
+    readiness = {
+        "ok": bool((health or {}).get("ok")),
+        "count_ok": bool((health or {}).get("count_ok")),
+        "get_ok": bool((health or {}).get("get_ok")),
+        "query_ok": bool((health or {}).get("query_ok")),
+        "error": str((health or {}).get("error") or ""),
+        "missing_uploaded_files": list((health or {}).get("missing_uploaded_files") or []),
+        "diagnostics_total_chunks": int((health or {}).get("diagnostics_total_chunks") or 0),
+        "diagnostics_total_files": int((health or {}).get("diagnostics_total_files") or 0),
+        "temp_reopen_health": dict(temp_reopen_health or {}),
+        "final_health": dict(health or {}),
+        "indexing_total": indexing_total,
+        "indexing_unindexed": indexing_unindexed,
+        "persisted_count": persisted_count,
+        "total_chunks": n_total,
+        "hnsw_artifacts": [str(p) for p in hnsw_files],
+    }
+    active_subdir = _manifest_subdir_for_chroma_dir(cfg, active_dir)
+    manifest_saved = False
+    manifest_save_error = ""
     if store is not None:
         try:
             store.save_index_manifest(
@@ -368,9 +1108,47 @@ def iter_build_index(
                 chunk_size=int(chunk_size),
                 chunk_overlap=int(chunk_overlap),
                 files=snap,
+                build_id=build_id,
+                active_chroma_subdir=active_subdir,
+                activated_at=built_iso,
+                readiness=readiness,
             )
+            manifest_saved = True
+        except Exception as e:
+            manifest_save_error = f"{type(e).__name__}: {e}"
+            manifest_saved = False
+    if not manifest_saved:
+        try:
+            from rag_lite.store import ExperimentStore
+
+            ExperimentStore(cfg.sqlite_path).save_index_manifest(
+                embed_model=em_name,
+                chunk_mode=(chunk_mode or "sentence").strip().lower(),
+                chunk_size=int(chunk_size),
+                chunk_overlap=int(chunk_overlap),
+                files=snap,
+                build_id=build_id,
+                active_chroma_subdir=active_subdir,
+                activated_at=built_iso,
+                readiness=readiness,
+            )
+            manifest_saved = True
+        except Exception as e:
+            if not manifest_save_error:
+                manifest_save_error = f"{type(e).__name__}: {e}"
+            manifest_saved = False
+
+    if not manifest_saved:
+        _clear_chroma_process_cache()
+        try:
+            shutil.rmtree(active_dir, ignore_errors=True)
         except Exception:
             pass
+        yield (
+            "失败：新索引已构建并通过自检，但写入 manifest 失败，已回滚该新版本。"
+            f" 错误：{manifest_save_error or '未知错误'}"
+        )
+        return
 
     yield f"完成：索引已就绪，共 {n_total} 个块。可到「对话」页提问。"
 
@@ -678,14 +1456,14 @@ def _chroma_get_all_records(coll: Any, include: list[str]) -> tuple[list[Any], l
 
 
 def _chroma_all_ids_paginated(coll: Any, page: int = 200) -> list[str]:
-    """仅分页收集全部 id（顺序与集合默认迭代一致），避免 offset+并行字段错位。"""
-    n_total = int(coll.count())
-    if n_total <= 0:
-        return []
+    """仅分页收集全部 id，避免依赖 count() 触发 HNSW 读取。"""
     out: list[str] = []
     offset = 0
-    while offset < n_total:
-        batch = coll.get(include=["metadatas"], limit=page, offset=offset)
+    while True:
+        try:
+            batch = coll.get(include=["metadatas"], limit=page, offset=offset)
+        except Exception:
+            break
         ids = batch.get("ids") or []
         if not ids:
             break
@@ -803,39 +1581,116 @@ def _filename_appears_in_meta_blob(meta: dict[str, Any], want_name: str) -> bool
     return False
 
 
-def chroma_collection_count(cfg: AppConfig) -> int:
-    """当前 Chroma 集合中的向量条数；-1 表示无法读取。"""
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
+def _collection_from_index(index: Any | None) -> Any | None:
+    if index is None:
+        return None
+    vs = getattr(index, "_vector_store", None) or getattr(index, "vector_store", None)
+    if vs is None:
+        return None
+    return getattr(vs, "_collection", None) or getattr(vs, "client", None)
 
-    if not cfg.chroma_dir.is_dir():
-        return -1
+
+def _collection_supports_metadata_reads(coll: Any) -> bool:
     try:
-        client = chromadb.PersistentClient(
-            path=str(cfg.chroma_dir),
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-        coll = client.get_collection(cfg.collection_name)
+        coll.get(include=["metadatas"], limit=1, offset=0)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_resolve_path_label(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def _open_chroma_collection_info(
+    cfg: AppConfig,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+    chroma_dir_override: Path | None = None,
+) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "collection": None,
+        "source": "none",
+        "requested_prefer_index": bool(prefer_index),
+        "fallback_used": False,
+        "active_chroma_dir": "",
+        "fallback_reason": "",
+    }
+    active_dir = chroma_dir_override or resolve_active_chroma_dir(cfg, allow_legacy=True)
+    info["active_chroma_dir"] = _safe_resolve_path_label(active_dir)
+    if prefer_index:
+        coll = _collection_from_index(index)
+        if coll is not None:
+            if _collection_supports_metadata_reads(coll):
+                info["collection"] = coll
+                info["source"] = "index"
+                return info
+            info["fallback_used"] = True
+            info["fallback_reason"] = "index_collection_metadata_read_failed"
+        elif index is not None:
+            info["fallback_used"] = True
+            info["fallback_reason"] = "index_collection_missing"
+    if active_dir is None:
+        return info
+    info["collection"] = _open_chroma_collection_for_dir(active_dir, cfg.collection_name)
+    if info["collection"] is not None:
+        info["source"] = "disk"
+    return info
+
+
+def _open_chroma_collection(
+    cfg: AppConfig,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+    chroma_dir_override: Path | None = None,
+) -> Any | None:
+    return _open_chroma_collection_info(
+        cfg,
+        index=index,
+        prefer_index=prefer_index,
+        chroma_dir_override=chroma_dir_override,
+    ).get("collection")
+
+
+def chroma_collection_count(
+    cfg: AppConfig,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+) -> int:
+    """当前 Chroma 集合中的向量条数；-1 表示无法读取。"""
+    try:
+        info = _open_chroma_collection_info(cfg, index=index, prefer_index=prefer_index)
+        coll = info.get("collection")
+        if coll is None:
+            return -1
         return int(coll.count())
     except Exception:
         return -1
 
 
-def chroma_sample_distinct_filenames(cfg: AppConfig, limit: int = 30) -> list[str]:
+def chroma_sample_distinct_filenames(
+    cfg: AppConfig,
+    limit: int = 30,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+) -> list[str]:
     """
     扫描当前集合，从元数据中提取可见的文件名（用于预览失败时的排查提示）。
     """
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-
-    if not cfg.chroma_dir.is_dir():
-        return []
     try:
-        client = chromadb.PersistentClient(
-            path=str(cfg.chroma_dir),
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-        coll = client.get_collection(cfg.collection_name)
+        info = _open_chroma_collection_info(cfg, index=index, prefer_index=prefer_index)
+        coll = info.get("collection")
+        if coll is None:
+            return []
         all_ids = _chroma_all_ids_paginated(coll)
         triples = _chroma_get_docs_metas_by_ids(coll, all_ids, batch_size=48)
     except Exception:
@@ -854,7 +1709,145 @@ def chroma_sample_distinct_filenames(cfg: AppConfig, limit: int = 30) -> list[st
     return sorted(out, key=_norm_name)
 
 
-def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
+def _scan_doc_class_label(value: Any) -> str:
+    mapping = {
+        "text_normal": "正常文本",
+        "low_text_normal": "低文本但正常",
+        "scan_suspected": "疑似扫描件",
+        "scan_recoverable": "扫描可恢复",
+        "extract_failed": "抽取失败",
+        "ocr_polluted": "OCR 污染",
+    }
+    key = str(value or "").strip().lower()
+    return mapping.get(key, str(value or "").strip())
+
+
+def _scan_doc_reason_label(value: Any) -> str:
+    mapping = {
+        "native_text_sufficient": "原生文本充足",
+        "few_pages_with_some_native_text": "页数少且存在原生文本",
+        "fallback_pages_mostly_suspicious": "fallback 页大多被判为可疑 OCR",
+        "native_text_sparse_but_fallback_recovered": "原生文本稀疏，但 fallback 恢复出正文",
+        "native_text_sparse_and_page_images_dominate": "原生文本极少，页面图像特征占主导",
+        "fallback_attempted_without_usable_text": "已尝试 fallback，但没有得到可用正文",
+        "low_text_without_scan_pattern": "文本少，但不符合扫描件特征",
+    }
+    key = str(value or "").strip().lower()
+    return mapping.get(key, str(value or "").strip())
+
+
+_ZERO_CHUNK_STATUS_LABELS = {
+    "indexed": "已入库",
+    "zero_chunk": "未入库（0 块）",
+}
+
+
+def _empty_diag_row(file_name: str) -> dict[str, Any]:
+    return {
+        "file_name": file_name,
+        "chunk_count": 0,
+        "avg_chars": 0,
+        "max_chars": 0,
+        "empty_chunks": 0,
+        "image_hint_chunks": 0,
+        "ocr_hint_chunks": 0,
+        "vision_hint_chunks": 0,
+        "pdf_doc_class": "",
+        "pdf_doc_class_label": "",
+        "pdf_doc_class_reason": "",
+        "pdf_doc_class_reason_label": "",
+        "pdf_text_pages": 0,
+        "pdf_page_count": 0,
+        "pdf_text_chars": 0,
+        "pdf_text_lines": 0,
+        "pdf_text_page_ratio_pct": 0,
+        "pdf_fallback_text_ratio_pct": 0,
+        "pdf_suspicious_page_ratio_pct": 0,
+        "index_status": "indexed",
+        "index_status_label": _ZERO_CHUNK_STATUS_LABELS["indexed"],
+        "_char_sum": 0,
+    }
+
+
+def _apply_scan_meta_to_diag_row(row: dict[str, Any], meta: dict[str, Any] | None) -> None:
+    m = meta if isinstance(meta, dict) else {}
+    doc_class = str(m.get("pdf_doc_class") or "").strip()
+    if doc_class:
+        row["pdf_doc_class"] = doc_class
+        row["pdf_doc_class_label"] = _scan_doc_class_label(doc_class)
+    reason = str(m.get("pdf_doc_class_reason") or "").strip()
+    if reason:
+        row["pdf_doc_class_reason"] = reason
+        row["pdf_doc_class_reason_label"] = _scan_doc_reason_label(reason)
+    for key in (
+        "pdf_text_pages",
+        "pdf_page_count",
+        "pdf_text_chars",
+        "pdf_text_lines",
+        "pdf_text_page_ratio_pct",
+        "pdf_fallback_text_ratio_pct",
+        "pdf_suspicious_page_ratio_pct",
+    ):
+        try:
+            row[key] = int(m.get(key) or 0)
+        except (TypeError, ValueError):
+            row[key] = 0
+
+
+def _manifest_file_scan_meta(cfg: AppConfig) -> dict[str, dict[str, Any]]:
+    manifest = _load_index_manifest(cfg)
+    if not isinstance(manifest, dict):
+        return {}
+    files = manifest.get("files") or []
+    out: dict[str, dict[str, Any]] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        out[_filename_sig(name)] = dict(item)
+    return out
+
+
+def _collect_doc_manifest_rows(docs: list[Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for doc in docs:
+        meta = dict(getattr(doc, "metadata", None) or {})
+        file_name = str(meta.get("file_name") or meta.get("file_path") or "").strip()
+        if not file_name:
+            continue
+        base = str(Path(file_name).name)
+        sig = _filename_sig(base)
+        row = out.setdefault(sig, {"name": base})
+        row["name"] = base
+        for key in (
+            "pdf_doc_class",
+            "pdf_doc_class_reason",
+            "pdf_text_pages",
+            "pdf_page_count",
+            "pdf_text_chars",
+            "pdf_text_lines",
+            "pdf_text_page_ratio_pct",
+            "pdf_fallback_text_ratio_pct",
+            "pdf_suspicious_page_ratio_pct",
+            "image_enrichment_summary",
+        ):
+            val = meta.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str) and not val.strip():
+                continue
+            row[key] = val
+    return out
+
+
+def chunk_diagnostics(
+    cfg: AppConfig,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+) -> dict[str, Any]:
     """
     汇总当前 Chroma 集合的切片质量统计，供验证环境做效果排查。
     返回：
@@ -863,29 +1856,36 @@ def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
         "files": [{...}, ...],
       }
     """
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-
     out: dict[str, Any] = {
         "summary": {
             "total_chunks": 0,
             "total_files": 0,
+            "indexed_files": 0,
+            "zero_chunk_files": 0,
             "avg_chars": 0,
             "empty_chunks": 0,
             "image_hint_chunks": 0,
             "ocr_hint_chunks": 0,
             "vision_hint_chunks": 0,
+            "scan_doc_files": 0,
+            "ocr_polluted_files": 0,
+            "extract_failed_files": 0,
         },
         "files": [],
+        "collection_source": "none",
+        "collection_active_dir": "",
+        "collection_fallback_used": False,
+        "collection_fallback_reason": "",
     }
-    if not cfg.chroma_dir.is_dir():
-        return out
     try:
-        client = chromadb.PersistentClient(
-            path=str(cfg.chroma_dir),
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-        coll = client.get_collection(cfg.collection_name)
+        coll_info = _open_chroma_collection_info(cfg, index=index, prefer_index=prefer_index)
+        out["collection_source"] = str(coll_info.get("source") or "none")
+        out["collection_active_dir"] = str(coll_info.get("active_chroma_dir") or "")
+        out["collection_fallback_used"] = bool(coll_info.get("fallback_used"))
+        out["collection_fallback_reason"] = str(coll_info.get("fallback_reason") or "")
+        coll = coll_info.get("collection")
+        if coll is None:
+            return out
         all_ids = _chroma_all_ids_paginated(coll)
         triples = _chroma_get_docs_metas_by_ids(coll, all_ids, batch_size=64)
     except Exception:
@@ -907,23 +1907,12 @@ def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
         has_page_image = ("[第" in text and "图片" in text) or "[docx 内嵌图" in low
         has_ocr = "ocr" in low
         has_vision = "vision" in low or "ocr+vision" in low
-        row = per_file.setdefault(
-            file_name,
-            {
-                "file_name": file_name,
-                "chunk_count": 0,
-                "avg_chars": 0,
-                "max_chars": 0,
-                "empty_chunks": 0,
-                "image_hint_chunks": 0,
-                "ocr_hint_chunks": 0,
-                "vision_hint_chunks": 0,
-                "_char_sum": 0,
-            },
-        )
+        row = per_file.setdefault(file_name, _empty_diag_row(file_name))
         row["chunk_count"] += 1
         row["_char_sum"] += chars
         row["max_chars"] = max(int(row["max_chars"]), chars)
+        if not row.get("pdf_doc_class") and str(m.get("pdf_doc_class") or "").strip():
+            _apply_scan_meta_to_diag_row(row, m)
         if chars == 0:
             row["empty_chunks"] += 1
         if has_page_image:
@@ -933,10 +1922,22 @@ def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
         if has_vision:
             row["vision_hint_chunks"] += 1
 
+    manifest_meta = _manifest_file_scan_meta(cfg)
+    expected_names = _expected_uploaded_filenames(cfg)
+    for name in expected_names:
+        sig = _filename_sig(name)
+        row = per_file.get(name)
+        if row is None:
+            row = _empty_diag_row(name)
+            row["index_status"] = "zero_chunk"
+            row["index_status_label"] = _ZERO_CHUNK_STATUS_LABELS["zero_chunk"]
+            per_file[name] = row
+        if not row.get("pdf_doc_class"):
+            _apply_scan_meta_to_diag_row(row, manifest_meta.get(sig) or {})
+
     total_chunks = len(triples)
     summary = out["summary"]
     summary["total_chunks"] = total_chunks
-    summary["total_files"] = len(per_file)
     summary["avg_chars"] = round(total_chars / total_chunks, 1) if total_chunks else 0
     for row in per_file.values():
         row["avg_chars"] = round(row.pop("_char_sum") / row["chunk_count"], 1) if row["chunk_count"] else 0
@@ -944,6 +1945,18 @@ def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
         summary["image_hint_chunks"] += int(row["image_hint_chunks"])
         summary["ocr_hint_chunks"] += int(row["ocr_hint_chunks"])
         summary["vision_hint_chunks"] += int(row["vision_hint_chunks"])
+        if int(row.get("chunk_count") or 0) > 0:
+            summary["indexed_files"] += 1
+        else:
+            summary["zero_chunk_files"] += 1
+        doc_class = str(row.get("pdf_doc_class") or "")
+        if doc_class in ("scan_suspected", "scan_recoverable"):
+            summary["scan_doc_files"] += 1
+        elif doc_class == "ocr_polluted":
+            summary["ocr_polluted_files"] += 1
+        elif doc_class == "extract_failed":
+            summary["extract_failed_files"] += 1
+    summary["total_files"] = len(per_file)
     out["files"] = sorted(
         per_file.values(),
         key=lambda x: (-int(x["chunk_count"]), _norm_name(x["file_name"])),
@@ -951,37 +1964,122 @@ def chunk_diagnostics(cfg: AppConfig) -> dict[str, Any]:
     return out
 
 
+def _expected_uploaded_filenames(cfg: AppConfig) -> list[str]:
+    return [str(x.get("name") or "").strip() for x in uploaded_files_snapshot(cfg) if str(x.get("name") or "").strip()]
+
+
+def _missing_uploaded_filenames(expected_names: list[str], diag_files: list[dict[str, Any]]) -> list[str]:
+    present = {
+        _filename_sig(str(x.get("file_name") or ""))
+        for x in diag_files
+        if str(x.get("file_name") or "").strip() and str(x.get("file_name") or "").strip() != "unknown"
+    }
+    out: list[str] = []
+    for name in expected_names:
+        if _filename_sig(name) not in present:
+            out.append(name)
+    return sorted(out, key=_norm_name)
+
+
+
+_DEFAULT_EXCLUDED_DOC_CLASSES = ("ocr_polluted", "extract_failed")
+
+
+def build_excluded_file_set(
+    cfg: AppConfig,
+    index: Any | None = None,
+    *,
+    prefer_index: bool = True,
+    excluded_doc_classes: list[str] | tuple[str, ...] | None = None,
+    include_zero_chunk: bool = True,
+) -> dict[str, Any]:
+    classes = [
+        str(x or "").strip().lower()
+        for x in (excluded_doc_classes or _DEFAULT_EXCLUDED_DOC_CLASSES)
+        if str(x or "").strip()
+    ]
+    diag = chunk_diagnostics(cfg, index=index, prefer_index=prefer_index)
+    excluded: list[str] = []
+    seen: set[str] = set()
+    counts = {
+        "by_doc_class": 0,
+        "by_zero_chunk": 0,
+    }
+    for row in diag.get("files") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("file_name") or "").strip()
+        if not name:
+            continue
+        doc_class = str(row.get("pdf_doc_class") or "").strip().lower()
+        index_status = str(row.get("index_status") or "").strip().lower()
+        should_exclude = False
+        if doc_class and doc_class in classes:
+            should_exclude = True
+            counts["by_doc_class"] += 1
+        elif include_zero_chunk and index_status == "zero_chunk":
+            should_exclude = True
+            counts["by_zero_chunk"] += 1
+        if not should_exclude:
+            continue
+        sig = _filename_sig(name)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        excluded.append(name)
+    excluded.sort(key=_norm_name)
+    return {
+        "excluded_files": excluded,
+        "excluded_doc_classes": classes,
+        "include_zero_chunk": bool(include_zero_chunk),
+        "excluded_count": len(excluded),
+        "excluded_by_doc_class_count": int(counts["by_doc_class"]),
+        "excluded_by_zero_chunk_count": int(counts["by_zero_chunk"]),
+        "chunk_diag_summary": dict(diag.get("summary") or {}),
+    }
+
+
 def fetch_chunks_for_file(
     cfg: AppConfig,
     filename: str,
     *,
     max_chunks: int = 500,
-) -> tuple[list[dict[str, Any]], int]:
+    index: Any | None = None,
+    prefer_index: bool = True,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     """
     从当前 Chroma 集合读取指定文件名的切片正文（与最近一次成功构建写入的集合一致）。
-    返回 (列表项, 匹配到的总块数)；列表项为 {\"i\", \"node_id\", \"text\", \"meta\"}，
+    返回 (列表项, 匹配到的总块数, 集合来源信息)；列表项为 {"i", "node_id", "text", "meta"}，
     按文档原文顺序排序：优先 start_char_idx、其次 end_char_idx（顶层或 _node_content 内），最后 node_id；
     超过 max_chunks 时截断列表，总数仍为匹配总数。
     """
     fn = _nfc(Path(str(filename).strip()).name)
+    coll_info = _open_chroma_collection_info(cfg, index=index, prefer_index=prefer_index)
+    source_info = {
+        "source": str(coll_info.get("source") or "none"),
+        "active_chroma_dir": str(coll_info.get("active_chroma_dir") or ""),
+        "fallback_used": bool(coll_info.get("fallback_used")),
+        "fallback_reason": str(coll_info.get("fallback_reason") or ""),
+        "file_diag": {},
+    }
+    manifest_meta = _manifest_file_scan_meta(cfg)
+    sig = _filename_sig(fn) if fn else ""
+    if sig and sig in manifest_meta:
+        row = _empty_diag_row(fn)
+        row["index_status"] = "zero_chunk"
+        row["index_status_label"] = _ZERO_CHUNK_STATUS_LABELS["zero_chunk"]
+        _apply_scan_meta_to_diag_row(row, manifest_meta.get(sig) or {})
+        source_info["file_diag"] = row
     if not fn:
-        return [], 0
+        return [], 0, source_info
 
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-
-    if not cfg.chroma_dir.is_dir():
-        return [], 0
-    client = chromadb.PersistentClient(
-        path=str(cfg.chroma_dir),
-        settings=ChromaSettings(anonymized_telemetry=False),
-    )
     try:
-        coll = client.get_collection(cfg.collection_name)
+        coll = coll_info.get("collection")
+        if coll is None:
+            return [], 0, source_info
     except Exception:
-        return [], 0
+        return [], 0, source_info
 
-    n_total = int(coll.count())
     rows: list[tuple[str, str, dict[str, Any]]] = []
     res = None
     for fn_try in _filename_query_variants(fn):
@@ -989,7 +2087,7 @@ def fetch_chunks_for_file(
             res = coll.get(
                 where={"file_name": fn_try},
                 include=["documents", "metadatas", "ids"],
-                limit=max(n_total, 1),
+                limit=max(1, int(max_chunks)),
             )
         except Exception:
             res = None
@@ -1004,7 +2102,6 @@ def fetch_chunks_for_file(
             for nid, doc, m in cand
             if _metadata_matches_filename(m, fn) or _filename_appears_in_meta_blob(m, fn)
         ]
-        # where 已命中时优先用结构化+子串匹配；若元数据异常导致全被滤掉，仍展示 where 拉回的块（信任 Chroma）
         rows = filtered if filtered else list(cand)
 
     if not rows:
@@ -1012,7 +2109,7 @@ def fetch_chunks_for_file(
             all_ids = _chroma_all_ids_paginated(coll)
             triples = _chroma_get_docs_metas_by_ids(coll, all_ids, batch_size=48)
         except Exception:
-            return [], 0
+            return [], 0, source_info
         flags = [
             _metadata_matches_filename(m, fn) or _filename_appears_in_meta_blob(m, fn)
             for _, _, m in triples
@@ -1042,9 +2139,178 @@ def fetch_chunks_for_file(
         rows = rows[:max_chunks]
 
     out: list[dict[str, Any]] = []
+    file_diag_meta: dict[str, Any] = {}
     for i, (nid, text, m) in enumerate(rows, 1):
+        if not file_diag_meta and isinstance(m, dict):
+            file_diag_meta = {
+                "pdf_doc_class": str(m.get("pdf_doc_class") or "").strip(),
+                "pdf_doc_class_label": _scan_doc_class_label(m.get("pdf_doc_class")),
+                "pdf_doc_class_reason": str(m.get("pdf_doc_class_reason") or "").strip(),
+                "pdf_doc_class_reason_label": _scan_doc_reason_label(m.get("pdf_doc_class_reason")),
+                "pdf_text_pages": int(m.get("pdf_text_pages") or 0),
+                "pdf_page_count": int(m.get("pdf_page_count") or 0),
+                "pdf_text_chars": int(m.get("pdf_text_chars") or 0),
+                "pdf_text_lines": int(m.get("pdf_text_lines") or 0),
+                "pdf_text_page_ratio_pct": int(m.get("pdf_text_page_ratio_pct") or 0),
+                "pdf_fallback_text_ratio_pct": int(m.get("pdf_fallback_text_ratio_pct") or 0),
+                "pdf_suspicious_page_ratio_pct": int(m.get("pdf_suspicious_page_ratio_pct") or 0),
+            }
         out.append({"i": i, "node_id": nid, "text": text, "meta": m})
-    return out, total_found
+    source_info["file_diag"] = file_diag_meta
+    return out, total_found, source_info
+
+
+def self_check_index(
+    cfg: AppConfig,
+    *,
+    embed_model_override: str | None = None,
+    chroma_dir_override: Path | None = None,
+    require_query: bool = True,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "count_ok": False,
+        "get_ok": False,
+        "query_ok": False,
+        "count": 0,
+        "sample_id": "",
+        "sample_query": "",
+        "diagnostics_total_chunks": 0,
+        "diagnostics_total_files": 0,
+        "missing_uploaded_files": [],
+        "top_files": [],
+        "error": "",
+    }
+    try:
+        coll = _open_chroma_collection(
+            cfg,
+            index=None,
+            prefer_index=False,
+            chroma_dir_override=chroma_dir_override,
+        )
+        if coll is None:
+            out["error"] = "无法打开 Chroma 集合"
+            return out
+
+        all_ids: list[str] = []
+        count_error = ""
+        compacted_count = 0
+        try:
+            compacted_count = _chroma_count_index_only(coll)
+            count = compacted_count
+        except Exception as e:
+            count_error = f"{type(e).__name__}: {e}"
+            all_ids = _chroma_all_ids_paginated(coll)
+            count = len(all_ids)
+        out["count"] = count
+        out["count_ok"] = count > 0
+        if count <= 0:
+            wal_count = 0
+            try:
+                wal_count = int(coll.count())
+            except Exception:
+                wal_count = 0
+            if wal_count > 0:
+                # 可靠模式（高 sync_threshold）下，集合可能长期只在 WAL 可见；
+                # 对可用性校验而言，把 WAL 计数视为有效记录数。
+                count = wal_count
+                out["count"] = count
+                out["count_ok"] = True
+            else:
+                out["error"] = count_error or "集合为空"
+                return out
+
+        if not all_ids:
+            all_ids = _chroma_all_ids_paginated(coll)
+        if not all_ids:
+            out["error"] = "集合可计数但无法枚举样本 id"
+            return out
+        if count != len(all_ids):
+            # 不把计数差异作为硬失败；在 WAL/压实切换窗口里两者可能短时不一致。
+            out["error"] = f"计数偏差提示：index_only={count}, ids={len(all_ids)}"
+
+        sample_rows = _chroma_get_docs_metas_by_ids(coll, all_ids[:1], batch_size=1)
+        if not sample_rows:
+            out["error"] = "集合可计数但无法读取样本"
+            return out
+        sample_id, sample_doc, _ = sample_rows[0]
+        sample_doc = str(sample_doc or "").strip()
+        out["sample_id"] = str(sample_id)
+        out["get_ok"] = True
+        query_text = sample_doc[:120].strip() or out["sample_id"]
+        out["sample_query"] = query_text
+
+        last_query_error = ""
+        query_attempts = 18 if chroma_dir_override is not None else 6
+        index = None
+        if require_query:
+            for attempt in range(query_attempts):
+                try:
+                    index = load_index_from_disk(
+                        cfg,
+                        embed_model_override=embed_model_override,
+                        chroma_dir_override=chroma_dir_override,
+                    )
+                    if index is None:
+                        last_query_error = "无法从磁盘加载索引"
+                    else:
+                        retriever = VectorIndexRetriever(
+                            index,
+                            similarity_top_k=1,
+                            embed_model=getattr(index, "_embed_model", None),
+                            node_ids=None,
+                            callback_manager=getattr(index, "_callback_manager", None),
+                            object_map=getattr(index, "_object_map", None),
+                        )
+                        nodes = retriever.retrieve(query_text)
+                        out["query_ok"] = len(nodes) > 0
+                        if out["query_ok"]:
+                            break
+                        last_query_error = "query 无返回结果"
+                except Exception as e:
+                    last_query_error = f"{type(e).__name__}: {e}"
+                if attempt + 1 < query_attempts:
+                    _clear_chroma_process_cache()
+                    time.sleep(1.0 if chroma_dir_override is not None else 0.35)
+            if not out["query_ok"]:
+                out["error"] = last_query_error or "query 无返回结果"
+                return out
+
+        diag_cfg = cfg
+        diag_index = index
+        diag_prefer_index = True
+        if chroma_dir_override is not None:
+            diag_cfg = AppConfig(
+                root=cfg.root,
+                raw=dict(cfg.raw),
+            )
+            diag_cfg.raw["data_dir"] = str(chroma_dir_override.parent)
+            diag_cfg.raw["chroma_subdir"] = chroma_dir_override.name
+            diag_index = None
+            diag_prefer_index = False
+        try:
+            diag = chunk_diagnostics(diag_cfg, index=diag_index, prefer_index=diag_prefer_index)
+            summary = diag.get("summary") or {}
+            files = list(diag.get("files") or [])
+            out["diagnostics_total_chunks"] = int(summary.get("total_chunks") or 0)
+            out["diagnostics_total_files"] = int(summary.get("total_files") or 0)
+            out["top_files"] = [
+                {
+                    "file_name": str(x.get("file_name") or ""),
+                    "chunk_count": int(x.get("chunk_count") or 0),
+                }
+                for x in files[:10]
+            ]
+            expected_names = _expected_uploaded_filenames(cfg)
+            out["missing_uploaded_files"] = _missing_uploaded_filenames(expected_names, files)
+        except Exception as e:
+            # schema 差异（如 KeyError: '_type'）不再阻断索引上线
+            out["error"] = f"diagnostics skipped: {type(e).__name__}: {e}"
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
 
 
 def build_index(
@@ -1062,7 +2328,11 @@ def build_index(
     return last.startswith("完成："), last
 
 
-def load_index_from_disk(cfg: AppConfig, embed_model_override: str | None = None) -> VectorStoreIndex | None:
+def load_index_from_disk(
+    cfg: AppConfig,
+    embed_model_override: str | None = None,
+    chroma_dir_override: Path | None = None,
+) -> VectorStoreIndex | None:
     o = dict(cfg.ollama)
     if embed_model_override:
         o["embed_model"] = embed_model_override
@@ -1073,18 +2343,19 @@ def load_index_from_disk(cfg: AppConfig, embed_model_override: str | None = None
     )
     Settings.embed_model = embed
 
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-
-    if not cfg.chroma_dir.is_dir():
+    chroma_dir = chroma_dir_override or resolve_active_chroma_dir(cfg, allow_legacy=True)
+    if chroma_dir is None or not chroma_dir.is_dir():
         return None
-    chroma_client = chromadb.PersistentClient(
-        path=str(cfg.chroma_dir),
-        settings=ChromaSettings(anonymized_telemetry=False),
-    )
     try:
-        chroma_collection = chroma_client.get_collection(cfg.collection_name)
+        chroma_collection = _open_chroma_collection(
+            cfg,
+            index=None,
+            prefer_index=False,
+            chroma_dir_override=chroma_dir,
+        )
     except Exception:
+        return None
+    if chroma_collection is None:
         return None
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)

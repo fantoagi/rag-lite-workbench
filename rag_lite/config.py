@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
+
+
+def _is_ascii_only_path(p: Path) -> bool:
+    try:
+        str(p).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _stable_ascii_project_slug(root: Path) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "-", root.name).strip("-._") or "project"
+    digest = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:10]
+    return f"{base}-{digest}"
 
 
 @dataclass
@@ -23,7 +40,17 @@ class AppConfig:
 
     @property
     def chroma_dir(self) -> Path:
-        return self.data_dir / self.raw["chroma_subdir"]
+        raw_chroma_dir = self.raw.get("chroma_dir")
+        if raw_chroma_dir:
+            p = Path(str(raw_chroma_dir))
+            candidate = p if p.is_absolute() else (self.root / p).resolve()
+        else:
+            candidate = self.data_dir / self.raw["chroma_subdir"]
+        if os.name == "nt" and not _is_ascii_only_path(candidate):
+            local_appdata = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+            safe_root = local_appdata / "ClaudeCode" / "rag_lite_chroma" / _stable_ascii_project_slug(self.root)
+            candidate = safe_root / str(self.raw["chroma_subdir"])
+        return candidate.resolve()
 
     @property
     def sqlite_path(self) -> Path:

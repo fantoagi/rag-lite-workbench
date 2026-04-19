@@ -10,7 +10,13 @@ llama-index-core>=0.11.0
 llama-index-vector-stores-chroma>=0.3.0
 llama-index-llms-ollama>=0.3.0
 llama-index-embeddings-ollama>=0.4.0
-chromadb>=0.5.0
+# NOTE:
+# Chroma 1.5.x has shown unstable HNSW reopen behavior in this workstation setup
+# (SQLite rows persisted but HNSW segment reader fails on reopen).
+# Pin to the stable 0.5 line for llama-index-vector-stores-chroma in this project.
+chromadb==0.5.23
+chroma-hnswlib>=0.7.6
+numpy<2
 sentence-transformers>=3.0.0
 torch>=2.1.0
 pypdf>=4.0.0
@@ -19,3 +25,6 @@ pytesseract>=0.3.10
 Pillow>=10.0.0
 python-docx>=1.0.0
 pyyaml>=6.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.0
