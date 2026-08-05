@@ -336,7 +336,8 @@ class PlainPdfReader(BaseReader):
                 text = _merge_pdf_text_with_fallback(text, fallback_text)
                 fallback_text_added = True
             elif _pdf_text_too_sparse(text, min_chars=500, min_lines=20):
-                text = ""
+                # fallback 未补充出有效内容时保留原生稀疏文本，避免静默丢失可检索信息
+                meta["pdf_fallback_empty"] = 1
         _merge_pdf_scan_meta(meta, fallback_stats, fallback_text_added=fallback_text_added)
         yield Document(text=text, metadata=meta)
 
@@ -409,7 +410,8 @@ class HybridPdfReader(BaseReader):
                     text = _merge_pdf_text_with_fallback(text, fallback_text)
                     fallback_text_added = True
                 elif _pdf_text_too_sparse(text, min_chars=500, min_lines=20):
-                    text = ""
+                    # fallback 未补充出有效内容时保留原生稀疏文本，避免静默丢失可检索信息
+                    pass
             meta = dict(extra_info or {})
             meta.setdefault("file_name", path.name)
             meta.setdefault("file_path", str(path))

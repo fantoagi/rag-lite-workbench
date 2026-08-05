@@ -274,7 +274,7 @@ def _lines_from_paddle_result(result: Any) -> list[str]:
     """PP-OCR 2.x list layout; 3.x may return dict / OCRResult / rec_texts."""
     if result is None:
         return []
-    # 2.x: usually [ [ line, ... ] ]?????????????????? [ line, ... ]
+    # 2.x layout: [ [ line, ... ] ] (one inner list per page)
     if isinstance(result, list) and result:
         for candidate in (result[0], result):
             if not isinstance(candidate, list):
@@ -327,7 +327,7 @@ def _ocr_paddleocr_bytes(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
         try:
             from paddleocr import PaddleOCR
 
-            # PaddleOCR 3.x removed show_log; some builds reject unknown kwargs ?? try fallbacks.
+            # PaddleOCR 3.x dropped show_log; some builds reject unknown kwargs, so we try fallbacks.
             _last: Exception | None = None
             for kwargs in (
                 {"use_angle_cls": True, "lang": "ch"},
@@ -444,7 +444,7 @@ def ollama_vision_caption(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
             raw = resp.read().decode("utf-8", errors="replace")
         return json.loads(raw)
 
-    # 1) /api/chat ?? Ollama docs recommend this for multimodal
+    # 1) /api/chat - Ollama docs recommend this endpoint for multimodal
     try:
         chat_payload: dict[str, Any] = {
             "model": model,
@@ -471,7 +471,7 @@ def ollama_vision_caption(image_bytes: bytes, opts: ImageEnrichOptions) -> str:
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError, TypeError) as e:
         _ollama_vision_warn_once(f"Ollama /api/chat failed: {e}")
 
-    # 2) /api/generate ?? legacy multimodal
+    # 2) /api/generate - legacy multimodal endpoint
     try:
         gen_payload: dict[str, Any] = {
             "model": model,

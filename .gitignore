@@ -13,3 +13,16 @@ last-run-error.txt
 Thumbs.db
 Desktop.ini
 .cursor/
+
+# Local probe / agent scratch artifacts
+__tmp_*
+/_*.py
+_verify_roundtrip/
+_verify_roundtrip.db
+codex_verify_tmp/
+pytest-cache-files-*/
+ui_preview_rag.html
+
+# Large / local corpus PDFs (keep eval spreadsheets only)
+*.pdf
+**/~$*

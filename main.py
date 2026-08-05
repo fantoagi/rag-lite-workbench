@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import difflib
@@ -6,15 +6,40 @@ import html
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import operator
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
+
+
+class _ChromaTelemetryNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Failed to send telemetry event" not in record.getMessage()
+
+
+_CHROMA_TELEMETRY_FILTER = _ChromaTelemetryNoiseFilter()
+
+
+def _quiet_chroma_telemetry_logs() -> None:
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_CHROMA_TELEMETRY_FILTER)
+    for name in ("chromadb.telemetry", "chromadb.telemetry.product", "chromadb.telemetry.product.posthog", "posthog"):
+        logger = logging.getLogger(name)
+        logger.addFilter(_CHROMA_TELEMETRY_FILTER)
+        logger.setLevel(logging.CRITICAL)
+
+
+_quiet_chroma_telemetry_logs()
 
 if sys.version_info >= (3, 14):
     print(
@@ -360,8 +385,7 @@ def _gradio_major() -> int:
 
 
 _GRADIO_MAJOR = _gradio_major()
-# Gradio 6 起 Chatbot 默认仅接受 OpenAI messages；5.x 与 4.x 多为 [user, bot] 对话轮次
-CHAT_USE_OPENAI_MESSAGES = _GRADIO_MAJOR >= 6
+CHAT_USE_OPENAI_MESSAGES = True
 if _GRADIO_MAJOR >= 6:
     print(
         "[RAG-Lite] 提示: 检测到 Gradio 6+，导入会较慢。建议: pip install "
@@ -371,7 +395,7 @@ if _GRADIO_MAJOR >= 6:
 
 print(
     f"[RAG-Lite] Gradio {gr.__version__} 已就绪，本步耗时 {time.perf_counter() - _t_gradio:.1f} 秒；"
-    f" Chatbot 数据模式={'messages' if CHAT_USE_OPENAI_MESSAGES else 'tuples(5.x)'}",
+    " Chatbot 数据模式=messages",
     flush=True,
 )
 
@@ -388,6 +412,31 @@ from rag_lite.ingest import (
 from rag_lite.ollama_util import list_ollama_models, merge_model_choices
 from rag_lite import prefs as prefs_mod
 from rag_lite.store import ExperimentStore
+from rag_lite import eval_judge
+from rag_lite.eval_platform import (
+    attribution_code,
+    attribution_rows,
+    dataset_quality_rows,
+    dataset_quality_summary,
+)
+from rag_lite.eval_runner import (
+    effective_llm_model,
+    normalize_generation_mode,
+    normalize_retrieval_mode,
+    retrieval_flags,
+)
+from rag_lite.platform_ops import (
+    ollama_health_rows,
+    ollama_health_snapshot,
+    write_eval_case_compare,
+    write_eval_run_report,
+)
+from rag_lite.ui_kb import (
+    cleanup_old_index_versions,
+    index_ops_diagnostics,
+    index_ops_rows,
+    index_ops_summary_html,
+)
 
 print("[RAG-Lite] 加载 config.yaml 与本地目录 …", flush=True)
 cfg = load_config(ROOT)
@@ -544,7 +593,16 @@ def _sessions_table_value() -> list[list[str]]:
 
 def session_history_for_chatbot(session_id: int) -> list:
     rows = store.fetch_qa_rows_for_session(session_id)
-    return [[r["question"], r["answer"]] for r in rows]
+    out: list[dict[str, str]] = []
+    for r in rows:
+        out.append({"role": "user", "content": str(r.get("question") or "")})
+        diag = r.get('diagnostics') or {}
+        ui_progress = str(diag.get('ui_progress') or '').strip()
+        ans = str(r.get('answer') or '')
+        if ui_progress:
+            ans = f'{ui_progress}\n\n---\n\n{ans}'
+        out.append({"role": "assistant", "content": ans})
+    return out
 
 
 def kb_embed_warning_markdown(embed_selected: str) -> str:
@@ -572,6 +630,79 @@ def kb_embed_warning_markdown(embed_selected: str) -> str:
             f"**警告**：readiness 检测到 {int(index_state.get('missing_uploaded_files_count') or 0)} 个上传文件未进入当前索引。"
         )
     return "\n\n".join(parts)
+
+
+
+def _chroma_dir_ack_path() -> Path:
+    """Path of the small JSON file used to remember that the user has
+    acknowledged the chroma_dir silent-redirect warning."""
+    return cfg.data_dir / ".chroma_dir_redirect_acknowledged.json"
+
+
+def _chroma_dir_redirect_acknowledged() -> bool:
+    info = cfg.chroma_dir_redirect_info
+    if not info:
+        return True
+    p = _chroma_dir_ack_path()
+    if not p.is_file():
+        return False
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return bool(d.get("acknowledged")) and d.get("redirect_final") == info["final"]
+
+
+def kb_chroma_dir_redirect_warning_markdown() -> str:
+    """Return a Markdown warning explaining that the chroma index has been
+    silently relocated to %LOCALAPPDATA% because the project path contains
+    non-ASCII characters. Returns an empty string when no redirect is
+    active, or when the user has already acknowledged it for this exact
+    target path."""
+    info = cfg.chroma_dir_redirect_info
+    if not info or _chroma_dir_redirect_acknowledged():
+        return ""
+    return (
+        "**⚠️ 索引路径已重定向**：项目根目录含非 ASCII 字符，Chroma 索引实际存储于\n\n"
+        f"  `{info['final']}`\n\n"
+        f"原计划位置 `{info['original']}` 不会被使用。如需改回项目目录内，"
+        "请在 `config.yaml` 把 `chroma_dir` 显式指向一个 ASCII 路径，"
+        "或在 `%LOCALAPPDATA%` 之外选择一个 ASCII 目录。"
+    )
+
+
+def do_ack_chroma_dir_redirect():
+    """Dismiss handler: record the user's acknowledgement and hide the
+    warning + button. The ack file is keyed on the redirect target path,
+    so if the project path changes (different slug), the warning will
+    re-appear — which is the desired behavior."""
+    info = cfg.chroma_dir_redirect_info
+    if not info:
+        return gr.update(visible=False), gr.update(visible=False)
+    p = _chroma_dir_ack_path()
+    try:
+        payload = {
+            "acknowledged": True,
+            "redirect_final": info["final"],
+            "redirect_original": info["original"],
+            "reason": info.get("reason", ""),
+            "acknowledged_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[RAG-Lite] 写入 chroma 重定向确认文件失败: {exc}", file=sys.stderr, flush=True)
+    return gr.update(visible=False), gr.update(visible=False)
+
+
+def _norm_path_for_compare(path_text: str | None) -> str:
+    t = str(path_text or "").strip()
+    if not t:
+        return ""
+    t = t.replace("\\", "/")
+    while "//" in t:
+        t = t.replace("//", "/")
+    return t.casefold()
 
 
 def _build_index_status_snapshot() -> dict[str, Any]:
@@ -606,10 +737,12 @@ def _build_index_status_snapshot() -> dict[str, Any]:
             if name not in upload_names:
                 uploads_changed = True
                 break
+    active_norm = _norm_path_for_compare(active_label)
+    manifest_norm = _norm_path_for_compare(manifest_active)
     active_matches_manifest = bool(
-        manifest_active
-        and active_label
-        and (active_label == manifest_active or active_label.endswith(manifest_active))
+        manifest_norm
+        and active_norm
+        and (active_norm == manifest_norm or active_norm.endswith(manifest_norm))
     )
     readiness = dict(manifest.get("readiness") or {})
     final_health = dict(readiness.get("final_health") or {}) if isinstance(readiness.get("final_health"), dict) else {}
@@ -617,7 +750,7 @@ def _build_index_status_snapshot() -> dict[str, Any]:
         "active_label": active_label or "（未发现可用索引目录）",
         "manifest_build_id": str(manifest.get("build_id") or "").strip() or "—",
         "manifest_active_chroma_subdir": manifest_active or "—",
-        "readiness_ok": bool(readiness.get("ok") or final_health.get("ok")),
+        "readiness_ok": bool((readiness.get("ok") or final_health.get("ok")) and readiness.get("diagnostics_ok", True)),
         "uploads_changed_since_manifest": uploads_changed,
         "active_dir_matches_manifest": active_matches_manifest,
         "missing_uploaded_files_count": len(
@@ -694,11 +827,11 @@ def kb_files_table_value(embed_selected: str) -> list[list[str]]:
                 except Exception:
                     active_label = ""
             active_matches_manifest = bool(
-                manifest_active
-                and active_label
+                _norm_path_for_compare(manifest_active)
+                and _norm_path_for_compare(active_label)
                 and (
-                    active_label == manifest_active
-                    or active_label.endswith(manifest_active)
+                    _norm_path_for_compare(active_label) == _norm_path_for_compare(manifest_active)
+                    or _norm_path_for_compare(active_label).endswith(_norm_path_for_compare(manifest_active))
                 )
             )
             if prev and prev.get("mtime_ns") == f.get("mtime_ns") and int(prev.get("size", -1)) == sz:
@@ -798,7 +931,8 @@ def _kb_chunk_preview_html(row_idx: Any, embed_selected: str | None = None) -> s
         return '<p style="color:#92400e;margin:0;">请先在表格中<strong>点击一行</strong>选中文件。</p>'
     em = (embed_selected or "").strip() or None
     index = eng.get_index(cfg, embed_model=em)
-    chunks, total_found, source_info = ing.fetch_chunks_for_file(cfg, fn, index=index, prefer_index=True)
+    # Preview should reflect the currently activated on-disk index, not a possibly stale cached collection.
+    chunks, total_found, source_info = ing.fetch_chunks_for_file(cfg, fn, index=index, prefer_index=False)
     chroma_path = html.escape(str(source_info.get("active_chroma_dir") or active_chroma_label(cfg, store=store)))
     source = str(source_info.get("source") or "none")
     fallback_used = bool(source_info.get("fallback_used"))
@@ -811,7 +945,7 @@ def _kb_chunk_preview_html(row_idx: Any, embed_selected: str | None = None) -> s
         source_bits.append(f"原因：<code>{html.escape(fallback_reason)}</code>")
     source_html = f"<p style='margin:0.35em 0 0 0;color:#92400e;font-size:0.9em;'>{'；'.join(source_bits)}</p>" if fallback_used else ""
     if total_found == 0:
-        cc = chroma_collection_count(cfg, index=index, prefer_index=True)
+        cc = chroma_collection_count(cfg, index=index, prefer_index=False)
         if cc == 0:
             return (
                 f'<p style="color:#92400e;margin:0;">当前向量库为空（共 0 条，路径：<code>{chroma_path}</code>）。'
@@ -1044,33 +1178,8 @@ def _as_messages(history: list | None) -> list[dict]:
     return out
 
 
-def _messages_to_tuple_turns(messages: list[dict]) -> list[list]:
-    """Gradio 4.x Chatbot: [[user, bot], ...]"""
-    pairs: list[list] = []
-    i = 0
-    while i < len(messages):
-        m = messages[i]
-        role = m.get("role")
-        text = str(m.get("content", ""))
-        if role == "user":
-            if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
-                pairs.append([text, str(messages[i + 1].get("content", ""))])
-                i += 2
-            else:
-                pairs.append([text, ""])
-                i += 1
-        elif role == "assistant":
-            pairs.append(["", text])
-            i += 1
-        else:
-            i += 1
-    return pairs
-
-
 def _chatbot_value(messages: list[dict]) -> list:
-    if CHAT_USE_OPENAI_MESSAGES:
-        return messages
-    return _messages_to_tuple_turns(messages)
+    return messages
 
 
 def _preview_chunk_text(raw: str, max_chars: int = 160) -> str:
@@ -1187,6 +1296,9 @@ def _compact_diag_sources(rows: list[dict[str, Any]], limit: int = 12) -> list[d
                 "score": s.get("score"),
                 "score_kind": str(s.get("score_kind") or ""),
                 "vector_score": s.get("vector_score"),
+                "keyword_score": s.get("keyword_score"),
+                "merged_score": s.get("merged_score"),
+                "retrieval_sources": list(s.get("retrieval_sources") or []),
                 "preview": _preview_chunk_text(str(s.get("chunk") or ""), 220),
             }
         )
@@ -1198,6 +1310,8 @@ def _retrieval_diag_payload(
     query: str,
     vector_candidates: list[dict[str, Any]],
     final_sources: list[dict[str, Any]],
+    keyword_candidates: list[dict[str, Any]] | None = None,
+    merged_candidates: list[dict[str, Any]] | None = None,
     top_n: int,
     top_k: int,
     use_rerank: bool,
@@ -1208,8 +1322,11 @@ def _retrieval_diag_payload(
     excluded_candidate_count: int = 0,
     raw_query: str | None = None,
     query_anchors: list[str] | None = None,
+    retrieval_mode: str | None = None,
 ) -> dict[str, Any]:
-    before_names = [str(x.get("file_name") or "") for x in vector_candidates[: max(1, min(top_k, len(vector_candidates)))]]
+    keyword_candidates = list(keyword_candidates or [])
+    merged_candidates = list(merged_candidates or vector_candidates or [])
+    before_names = [str(x.get("file_name") or "") for x in merged_candidates[: max(1, min(top_k, len(merged_candidates)))]]
     after_names = [str(x.get("file_name") or "") for x in final_sources]
     excluded_clean = [str(x) for x in (excluded_files or []) if str(x or "").strip()]
     excluded_classes_clean = [str(x) for x in (excluded_doc_classes or []) if str(x or "").strip()]
@@ -1223,8 +1340,12 @@ def _retrieval_diag_payload(
         "top_k": int(top_k),
         "use_rerank": bool(use_rerank),
         "score_kind": score_kind,
-        "candidate_count": len(vector_candidates),
+        "candidate_count": len(merged_candidates),
+        "vector_candidate_count": len(vector_candidates),
+        "keyword_candidate_count": len(keyword_candidates),
+        "merged_candidate_count": len(merged_candidates),
         "final_count": len(final_sources),
+        "retrieval_mode": retrieval_mode or ("hybrid" if keyword_candidates else "vector"),
         "rerank_changed_order": before_names != after_names if bool(use_rerank) else False,
         "excluded_files": excluded_clean,
         "excluded_file_count": len(excluded_clean),
@@ -1233,6 +1354,9 @@ def _retrieval_diag_payload(
         "include_zero_chunk": bool(include_zero_chunk) if include_zero_chunk is not None else None,
         "excluded_candidate_count": int(excluded_candidate_count or 0),
         "vector_candidates": _compact_diag_sources(vector_candidates, limit=20),
+        "keyword_candidates": _compact_diag_sources(keyword_candidates, limit=20),
+        "merged_candidates": _compact_diag_sources(merged_candidates, limit=20),
+        "final_sources": _compact_diag_sources(final_sources, limit=12),
         "final_contexts": _compact_diag_sources(final_sources, limit=12),
     }
 
@@ -1241,19 +1365,23 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
     if not diag:
         return _DIAG_EMPTY_HTML
     cand = list(diag.get("vector_candidates") or [])
+    keyword = list(diag.get("keyword_candidates") or [])
+    merged = list(diag.get("merged_candidates") or [])
     finals = list(diag.get("final_contexts") or [])
     use_rerank = bool(diag.get("use_rerank"))
     score_kind = str(diag.get("score_kind") or "vector")
     summary = (
         f'<div class="rag-tip-block rag-tip-block--tight" style="margin-bottom:8px;">'
-        f'<p style="margin:0;"><strong>候选数：</strong>{int(diag.get("candidate_count") or 0)}'
-        f'　<strong>送入上下文：</strong>{int(diag.get("final_count") or 0)}'
-        f'　<strong>重排：</strong>{"开启" if use_rerank else "关闭"}'
-        f'　<strong>顺序变化：</strong>{"是" if diag.get("rerank_changed_order") else "否"}</p>'
-        f'<p style="margin:0.35em 0 0 0;"><strong>排除候选：</strong>{int(diag.get("excluded_candidate_count") or 0)}'
-        f'　<strong>排除文件数：</strong>{int(diag.get("excluded_file_count") or 0)}'
-        f'　<strong>排除分类：</strong>{html.escape("/".join([str(x) for x in (diag.get("excluded_doc_classes") or [])]) or "—")}'
-        f'　<strong>含 zero-chunk：</strong>{"是" if diag.get("include_zero_chunk") else "否"}</p>'
+        f'<p style="margin:0;"><strong>Merged candidates:</strong>{int(diag.get("candidate_count") or 0)}'
+        f' <strong>Vector:</strong>{int(diag.get("vector_candidate_count") or 0)}'
+        f' <strong>Keyword:</strong>{int(diag.get("keyword_candidate_count") or 0)}'
+        f' <strong>Context:</strong>{int(diag.get("final_count") or 0)}'
+        f' <strong>Rerank:</strong>{"on" if use_rerank else "off"}'
+        f' <strong>Order changed:</strong>{"yes" if diag.get("rerank_changed_order") else "no"}</p>'
+        f'<p style="margin:0.35em 0 0 0;"><strong>Excluded candidates:</strong>{int(diag.get("excluded_candidate_count") or 0)}'
+        f' <strong>Excluded files:</strong>{int(diag.get("excluded_file_count") or 0)}'
+        f' <strong>Excluded classes:</strong>{html.escape("/".join([str(x) for x in (diag.get("excluded_doc_classes") or [])]) or "-")}'
+        f' <strong>Includes zero-chunk:</strong>{"yes" if diag.get("include_zero_chunk") else "no"}</p>'
         f"</div>"
     )
 
@@ -1294,11 +1422,16 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
             f"<tbody>{''.join(body)}</tbody></table></div></details>"
         )
 
-    final_title = "最终送入上下文的 Top-K"
+    final_title = "Final Top-K contexts"
     if score_kind == "rerank":
-        final_title += "（重排后）"
-    return summary + _table("向量初筛 Top-N 候选", cand, show_vector=False) + _table(final_title, finals, show_vector=score_kind == "rerank")
-
+        final_title += " (after rerank)"
+    return (
+        summary
+        + _table("Vector Top-N candidates", cand, show_vector=True)
+        + _table("Keyword/BM25 Top-N candidates", keyword, show_vector=True)
+        + _table("Merged candidates", merged, show_vector=True)
+        + _table(final_title, finals, show_vector=True)
+    )
 
 def _chunk_diag_summary_html(diag: dict[str, Any]) -> str:
     summary = dict(diag.get("summary") or {})
@@ -1549,23 +1682,36 @@ def do_chat_stream(
         if len(prior_rows) == 0:
             store.update_session_meta(sid, title=qtext[:60])
 
-        nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
-        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
+        retrieval_result = eng.hybrid_retrieve(
+            cfg,
+            index,
+            qtext,
+            top_n,
+            top_k,
+            bool(use_rerank),
+            excluded_files,
+        )
+        vector_diag = eng.nodes_to_source_dicts(retrieval_result.vector_nodes, "vector")
+        keyword_diag = eng.nodes_to_source_dicts(retrieval_result.keyword_nodes, "keyword")
+        merged_diag = eng.nodes_to_source_dicts(retrieval_result.merged_nodes, "hybrid")
+        excluded_candidate_count = retrieval_result.excluded_candidate_count
         line1 = (
-            f"**① 向量检索完成**（候选 {len(nodes_vec)} 条 · 过滤后 {len(nodes_vec_filtered)} 条"
-            f" · 排除 {excluded_candidate_count} 条 · 初筛 Top-{top_n}）"
+            f"**Hybrid retrieval complete** (vector {len(retrieval_result.vector_nodes)} / "
+            f"keyword {len(retrieval_result.keyword_nodes)} / merged {len(retrieval_result.merged_nodes)} / "
+            f"excluded {excluded_candidate_count} / Top-{top_n})"
         )
         new_hist[-1]["content"] = line1
         yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
             _retrieval_diag_payload(
                 query=qtext,
                 vector_candidates=vector_diag,
+                keyword_candidates=keyword_diag,
+                merged_candidates=merged_diag,
                 final_sources=[],
                 top_n=top_n,
                 top_k=top_k,
                 use_rerank=bool(use_rerank),
-                score_kind="vector",
+                score_kind="hybrid",
                 excluded_files=excluded_files,
                 excluded_doc_classes=excluded_doc_classes,
                 include_zero_chunk=include_zero_chunk,
@@ -1573,25 +1719,7 @@ def do_chat_stream(
             )
         ), _out_msg()
 
-        if bool(use_rerank) and nodes_vec:
-            new_hist[-1]["content"] = f"{line1}\n\n**② Cross-Encoder 重排中…**"
-            yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
-                _retrieval_diag_payload(
-                    query=qtext,
-                    vector_candidates=vector_diag,
-                    final_sources=[],
-                    top_n=top_n,
-                    top_k=top_k,
-                    use_rerank=True,
-                    score_kind="vector",
-                    excluded_files=excluded_files,
-                    excluded_doc_classes=excluded_doc_classes,
-                    include_zero_chunk=include_zero_chunk,
-                    excluded_candidate_count=excluded_candidate_count,
-                )
-            ), _out_msg()
-
-        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec_filtered, top_k, bool(use_rerank))
+        nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
         nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
             cfg,
             qtext,
@@ -1604,6 +1732,8 @@ def do_chat_stream(
         diag_payload = _retrieval_diag_payload(
             query=qtext,
             vector_candidates=vector_diag,
+            keyword_candidates=keyword_diag,
+            merged_candidates=merged_diag,
             final_sources=sources,
             top_n=top_n,
             top_k=top_k,
@@ -1616,6 +1746,7 @@ def do_chat_stream(
         )
         diag_payload["context_selected_count"] = len(nodes_for_answer)
         diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
         diag_payload["index_state"] = dict(index_state)
         diag_payload["index_state_summary"] = index_summary
         diag_html = _retrieval_diag_html(diag_payload)
@@ -1688,7 +1819,7 @@ def do_chat_stream(
             return
 
         kind_zh = "重排" if kind == "rerank" else "向量截断"
-        if bool(use_rerank) and nodes_vec:
+        if bool(use_rerank) and retrieval_result.merged_nodes:
             progress_head = (
                 f"{line1}\n\n"
                 f"**② 重排完成**（{kind_zh}，送入上下文 {len(nodes_for_answer)} 条）\n\n"
@@ -1724,11 +1855,15 @@ def do_chat_stream(
             excluded_doc_classes=excluded_doc_classes,
             include_zero_chunk=include_zero_chunk,
         )
-        # 入库保存完整气泡内容（含进度行 + 分隔线 + 正文），切换会话回来时仍能看到各步
-        full_answer = (progress_head + sep + partial).strip()
+        # Store clean answer in qa_log.answer; the rich pre-answer scaffolding
+        # (Hybrid retrieval / rerank / generation markers) goes into
+        # diag_payload['ui_progress'] and is reconstructed by
+        # session_history_for_chatbot when the user switches back to this
+        # session, so the rich bubble still renders for replay.
+        diag_payload['ui_progress'] = progress_head
         LAST_QA_ID = store.insert_qa(
             question=qtext,
-            answer=full_answer,
+            answer=partial.strip(),
             sources=sources,
             params=params,
             diagnostics=diag_payload,
@@ -1738,7 +1873,32 @@ def do_chat_stream(
     except Exception:
         tb = traceback.format_exc()
         err = f"生成失败:\n```\n{tb}\n```"
-        LAST_QA_ID = None
+        try:
+            params = eng.build_params_snapshot(
+                cfg,
+                int(chunk_size),
+                int(chunk_overlap),
+                top_n,
+                top_k,
+                bool(use_rerank),
+                chunk_mode=cm,
+                llm_model=lm,
+                embed_model=em,
+                llm_num_ctx=nctx,
+                excluded_files=excluded_files,
+                excluded_doc_classes=excluded_doc_classes,
+                include_zero_chunk=include_zero_chunk,
+            )
+            LAST_QA_ID = store.insert_qa(
+                question=qtext,
+                answer=err,
+                sources=[],
+                params=params,
+                diagnostics={"index_state": dict(index_state), "error": "chat_exception"},
+                session_id=sid,
+            )
+        except Exception:
+            LAST_QA_ID = None
         new_hist[-1]["content"] = err
         yield _chatbot_value(new_hist), _sources_panel_html([]), _DIAG_EMPTY_HTML, _out_msg()
 
@@ -1758,10 +1918,10 @@ def do_export(fmt: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "json":
         dest = out_dir / "qa_export.json"
-        store.export_json(dest)
+        store.export_json(dest, include_eval=False)
     else:
         dest = out_dir / "qa_export.csv"
-        store.export_csv(dest)
+        store.export_csv(dest, include_eval=False)
     return str(dest.resolve())
 
 
@@ -1770,7 +1930,8 @@ def do_chunk_diagnostics(embed_selected: str | None = None):
     eng = _lazy_engine()
     em = (embed_selected or "").strip() or None
     index = eng.get_index(cfg, embed_model=em)
-    diag = ing.chunk_diagnostics(cfg, index=index, prefer_index=True)
+    # Diagnostics should inspect the active disk-backed collection so the panel matches current index state.
+    diag = ing.chunk_diagnostics(cfg, index=index, prefer_index=False)
     diag["active_chroma_label"] = active_chroma_label(cfg, store=store)
     rows = [
         [
@@ -1795,11 +1956,449 @@ def do_chunk_diagnostics(embed_selected: str | None = None):
     return _chunk_diag_summary_html(diag), rows
 
 
+def do_index_ops_diagnostics():
+    diag = index_ops_diagnostics(cfg, store=store, keep_recent=3)
+    return index_ops_summary_html(diag), index_ops_rows(diag)
+
+
+def do_index_cleanup_dry_run():
+    msg, diag = cleanup_old_index_versions(cfg, store=store, keep_recent=3, dry_run=True)
+    return msg, index_ops_summary_html(diag), index_ops_rows(diag)
+
+
+def do_index_cleanup_apply(confirmed: bool = False):
+    if not confirmed:
+        diag = index_ops_diagnostics(cfg, store=store, keep_recent=3)
+        return (
+            "\u672a\u786e\u8ba4\uff1a\u8bf7\u52fe\u9009\u201c\u6211\u5df2\u786e\u8ba4\u8981\u6e05\u7406\u4ee5\u4e0a\u76ee\u5f55\uff08\u4e0d\u53ef\u6062\u590d\uff09\u201d\u540e\u518d\u70b9 Apply\u3002",
+            index_ops_summary_html(diag),
+            index_ops_rows(diag),
+        )
+    msg, diag = cleanup_old_index_versions(cfg, store=store, keep_recent=3, dry_run=False)
+    return msg, index_ops_summary_html(diag), index_ops_rows(diag)
+
+
 def do_experiment_compare():
-    rows = _experiment_compare_rows(store.fetch_all_qa())
+    rows = _experiment_compare_rows(store.fetch_all_qa(include_eval=False))
     if not rows:
         rows = [["（暂无问答记录）", "", "", 0, 0, "否", 0, 0, 0, 0, "—", 0, 0]]
+    return rows, _eval_run_compare_rows(), _eval_run_diff_rows(), _eval_baseline_compare_rows()
+
+
+def _eval_run_compare_rows() -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for run in store.list_eval_runs(limit=100):
+        summary = run.get("summary") or {}
+        params = run.get("params") or {}
+        attrs = summary.get("attribution_counts") or {}
+        top_attr = ", ".join(
+            f"{k}:{v}" for k, v in sorted(attrs.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:3]
+        ) or "-"
+        rows.append(
+            [
+                int(run.get("id") or 0),
+                str(run.get("dataset_name") or ""),
+                str(run.get("name") or ""),
+                str(params.get("run_fingerprint") or ""),
+                str(params.get("retrieval_mode") or ""),
+                bool(params.get("vector_enabled", True)),
+                str(params.get("llm_model") or ""),
+                str(params.get("embed_model") or ""),
+                int(params.get("top_n") or 0),
+                int(params.get("top_k") or 0),
+                summary.get("candidate_hit_rate") or "-",
+                summary.get("context_hit_rate") or "-",
+                summary.get("chunk_hit_rate") or "-",
+                summary.get("answer_hit_rate") or "-",
+                int(summary.get("ok_count") or 0),
+                top_attr,
+            ]
+        )
+    return rows or [[0, "（暂无评测运行）", "", "", "", False, "", "", 0, 0, "-", "-", "-", "-", 0, "-"]]
+
+
+def _pct_text_to_float(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if not text or text in {"-", "—"}:
+        return None
+    try:
+        return float(text.rstrip("%"))
+    except ValueError:
+        return None
+
+
+def _format_metric_delta(current: Any, previous: Any) -> str:
+    cur = _pct_text_to_float(current)
+    prev = _pct_text_to_float(previous)
+    if cur is None or prev is None:
+        return "—"
+    delta = cur - prev
+    return f"{delta:+.1f}pp"
+
+
+def _nested_eval_value(data: dict[str, Any], dotted_key: str) -> Any:
+    cur: Any = data
+    for part in dotted_key.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _short_eval_value(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)[:260]
+    text = str(value)
+    return text if len(text) <= 260 else text[:257] + "..."
+
+
+def _top_eval_counts_text(counts: dict[str, Any], limit: int = 4) -> str:
+    if not counts:
+        return "-"
+    return ", ".join(
+        f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:limit]
+    ) or "-"
+
+
+def _eval_run_diff_rows() -> list[list[Any]]:
+    runs = store.list_eval_runs(limit=2)
+    if len(runs) < 2:
+        return [["（需要至少两个评测运行）", "-", "-", "-", "-"]]
+
+    current, previous = runs[0], runs[1]
+    cur_params = current.get("params") or {}
+    prev_params = previous.get("params") or {}
+    cur_summary = current.get("summary") or {}
+    prev_summary = previous.get("summary") or {}
+
+    rows: list[list[Any]] = [["RUN", f"#{current.get('id')} {current.get('name') or ''}", f"#{previous.get('id')} {previous.get('name') or ''}", "-", "按最近两次评测运行对比"]]
+
+    metric_specs = [
+        ("candidate_hit_rate", "候选命中率"),
+        ("context_hit_rate", "上下文命中率"),
+        ("chunk_hit_rate", "片段命中率"),
+        ("answer_hit_rate", "答案命中率"),
+        ("abstain_accuracy", "拒答准确率"),
+    ]
+    for key, label in metric_specs:
+        cur_val = cur_summary.get(key) or "-"
+        prev_val = prev_summary.get(key) or "-"
+        rows.append([label, cur_val, prev_val, _format_metric_delta(cur_val, prev_val), "核心指标变化"])
+    rows.append([
+        "OK 数",
+        int(cur_summary.get("ok_count") or 0),
+        int(prev_summary.get("ok_count") or 0),
+        int(cur_summary.get("ok_count") or 0) - int(prev_summary.get("ok_count") or 0),
+        "综合判定通过样本变化",
+    ])
+
+    changed_params = 0
+    param_specs = [
+        ("run_fingerprint", "Run fingerprint", "整体实验指纹变化"),
+        ("retrieval_mode", "检索模式", "检索管线变化会直接影响召回"),
+        ("generation_mode", "生成模式", "retrieval-only 仅跳过 LLM 生成"),
+        ("vector_enabled", "向量召回", "由 Retrieval mode 显式控制"),
+        ("keyword_enabled", "关键词召回", "由 Retrieval mode 显式控制"),
+        ("top_n", "Top-N", "候选池大小变化"),
+        ("top_k", "Top-K", "进入上下文数量变化"),
+        ("use_rerank", "重排", "重排启停可能改变最终片段"),
+        ("query_anchoring_enabled", "查询锚定", "金融文件名/问题锚定变化"),
+        ("llm_model", "LLM", "生成模型变化影响答案与拒答"),
+        ("embed_model", "Embedding", "向量模型变化影响候选召回"),
+        ("rerank_model", "Rerank 模型", "重排模型变化影响 Top-K"),
+        ("chunk_mode", "切分策略", "切片方式变化影响片段命中"),
+        ("chunk_size", "Chunk", "切片大小变化影响上下文粒度"),
+        ("chunk_overlap", "Overlap", "重叠变化影响跨片段信息保留"),
+    ]
+    for key, label, note in param_specs:
+        cur_val = cur_params.get(key)
+        prev_val = prev_params.get(key)
+        if cur_val != prev_val:
+            changed_params += 1
+            rows.append([label, _short_eval_value(cur_val), _short_eval_value(prev_val), "已变化", note])
+
+    fp_specs = [
+        ("run_fingerprint_payload.index_build_id", "索引 Build ID", "索引重建会影响候选空间"),
+        ("run_fingerprint_payload.index_active_dir", "活跃索引目录", "活跃 Chroma 目录不同需确认 manifest 指向"),
+        ("run_fingerprint_payload.index_chunk_count", "索引切片数", "索引切片数量变化会影响召回覆盖"),
+        ("run_fingerprint_payload.index_file_count", "索引文件数", "索引文件覆盖变化会影响目标文件命中"),
+    ]
+    for key, label, note in fp_specs:
+        cur_val = _nested_eval_value(cur_params, key)
+        prev_val = _nested_eval_value(prev_params, key)
+        if cur_val != prev_val:
+            changed_params += 1
+            rows.append([label, _short_eval_value(cur_val), _short_eval_value(prev_val), "已变化", note])
+
+    cur_quality = ((cur_summary.get("dataset_quality") or cur_params.get("dataset_quality") or {}).get("issue_counts") or {})
+    prev_quality = ((prev_summary.get("dataset_quality") or prev_params.get("dataset_quality") or {}).get("issue_counts") or {})
+    if cur_quality != prev_quality:
+        rows.append([
+            "评测集质量问题",
+            _top_eval_counts_text(cur_quality),
+            _top_eval_counts_text(prev_quality),
+            "已变化",
+            "样本治理变化会改变可评测样本口径",
+        ])
+
+    cur_attrs = cur_summary.get("attribution_counts") or {}
+    prev_attrs = prev_summary.get("attribution_counts") or {}
+    if cur_attrs != prev_attrs:
+        rows.append([
+            "Top 归因",
+            _top_eval_counts_text(cur_attrs),
+            _top_eval_counts_text(prev_attrs),
+            "已变化",
+            "用于定位是数据集、召回、重排、答案还是拒答策略导致",
+        ])
+
+    if changed_params == 0:
+        rows.append(["参数/索引", "未发现关键变化", "未发现关键变化", "一致", "若指标变化，优先查看本地模型波动、样本导入或运行时异常"])
     return rows
+
+
+def _eval_baseline_path() -> Path:
+    return cfg.data_dir / "eval_baselines.json"
+
+
+_EVAL_LOAD_ERRORS: dict[str, str] = {}
+
+def _eval_load_errors_text() -> str:
+    lines = []
+    for k, v in _EVAL_LOAD_ERRORS.items():
+        lines.append("\u26a0 " + str(Path(k).name) + ": " + str(v))
+    return "\n".join(lines)
+
+def _load_json_or_backup(path: Path) -> Any:
+    """Read JSON; on parse error, copy bytes to <name>.corrupt-<ts> and record a warning.
+    Returns the parsed JSON on success, None on missing file or parse error.
+    The caller is expected to fall back to a safe default (empty dict/list) when
+    None is returned. The backup lets the user inspect the broken file afterwards
+    while unblocking the app from silently losing state.
+    """
+    if not path.exists():
+        _EVAL_LOAD_ERRORS.pop(str(path), None)
+        return None
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        _EVAL_LOAD_ERRORS.pop(str(path), None)
+        return result
+    except Exception as exc:
+        try:
+            backup = path.with_name(path.name + ".corrupt-" + str(int(time.time())))
+            backup.write_bytes(path.read_bytes())
+            msg = "JSON \u635f\u574f\uff08" + type(exc).__name__ + ": " + str(exc) + "\uff09\uff0c\u5df2\u5907\u4efd\u5230 " + backup.name + "\uff0c\u5f53\u524d\u4e3a\u7a7a\u72b6\u6001"
+        except OSError as ioexc:
+            msg = "JSON \u635f\u574f\uff08" + type(exc).__name__ + ": " + str(exc) + "\uff09\uff0c\u5907\u4efd\u5931\u8d25\uff08" + str(ioexc) + "\uff09\uff0c\u5f53\u524d\u4e3a\u7a7a\u72b6\u6001"
+        _EVAL_LOAD_ERRORS[str(path)] = msg
+        logging.getLogger("rag_lite").warning("eval config %s corrupted: %s", path, exc)
+        return None
+
+
+def _load_eval_baselines() -> dict[str, int]:
+    path = _eval_baseline_path()
+    payload = _load_json_or_backup(path)
+    if not isinstance(payload, (dict, list)):
+        return {}
+    data = payload.get("baselines") if isinstance(payload, dict) else payload
+    out: dict[str, int] = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                out[str(int(k))] = int(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _atomic_write_json(path, payload: dict) -> None:
+    """Atomically write a JSON file via temp + os.replace.
+    Prevents partial/corrupt files if the process is killed mid-write.
+    Raises on any I/O error after removing the temp file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _save_eval_baselines(data: dict[str, int]) -> None:
+    _atomic_write_json(_eval_baseline_path(), {"baselines": data})
+
+
+def _eval_run_by_id(run_id: int | None) -> dict[str, Any] | None:
+    if not run_id:
+        return None
+    return next((r for r in store.list_eval_runs(limit=500) if int(r.get("id") or 0) == int(run_id)), None)
+
+
+def _latest_eval_run(dataset_id: int | None = None) -> dict[str, Any] | None:
+    return next(
+        (
+            r
+            for r in store.list_eval_runs(limit=500)
+            if dataset_id is None or int(r.get("dataset_id") or 0) == int(dataset_id)
+        ),
+        None,
+    )
+
+
+def _eval_baseline_compare_rows(dataset_id: int | None = None) -> list[list[Any]]:
+    latest = _latest_eval_run(dataset_id)
+    if not latest:
+        return [["（暂无评测运行）", "-", "-", "-", "-"]]
+    did = int(latest.get("dataset_id") or 0)
+    baseline_id = _load_eval_baselines().get(str(did))
+    baseline = _eval_run_by_id(baseline_id)
+    if not baseline:
+        return [[f"Dataset #{did}", f"latest RUN#{latest.get('id')}", "未设置 baseline", "-", "点击“设为Baseline”后建立稳定对比口径"]]
+    cur_summary = latest.get("summary") or {}
+    base_summary = baseline.get("summary") or {}
+    rows = [[
+        "RUN",
+        f"#{latest.get('id')} {latest.get('name') or ''}",
+        f"#{baseline.get('id')} {baseline.get('name') or ''}",
+        "-",
+        "当前最新 RUN vs baseline",
+    ]]
+    for key, label in [
+        ("candidate_hit_rate", "候选命中率"),
+        ("context_hit_rate", "上下文命中率"),
+        ("chunk_hit_rate", "片段命中率"),
+        ("answer_hit_rate", "答案命中率"),
+        ("abstain_accuracy", "拒答准确率"),
+    ]:
+        cur_val = cur_summary.get(key) or "-"
+        base_val = base_summary.get(key) or "-"
+        rows.append([label, cur_val, base_val, _format_metric_delta(cur_val, base_val), "相对 baseline 变化"])
+    return rows
+
+
+def _eval_dataset_blocking_issues(dataset_id: int | None) -> tuple[bool, list[str]]:
+    """Return (is_clean, blocker_codes) for a dataset.
+    Blocking issues are ones that would make a baseline run a poor reference:
+    the cases themselves are not trustworthy (unresolved filenames, ambiguous
+    matches, empty questions, or no expected answer/keywords for non-abstain cases).
+    Quality issues that are useful to know about (e.g. NO_TAG, NO_EXPECTED_CHUNK)
+    are intentionally non-blocking: a baseline can still be set on a dataset that
+    is missing tags or expected-chunk strings.
+    """
+    if not dataset_id:
+        return True, []
+    cases = store.fetch_eval_cases(int(dataset_id))
+    summary = dataset_quality_summary(cases, resolve_expected_file_details=_resolve_expected_eval_file_details)
+    counts = dict(summary.get("issue_counts") or {})
+    blocking = (
+        "EXPECTED_FILE_UNRESOLVED",
+        "EXPECTED_FILE_AMBIGUOUS",
+        "EMPTY_QUESTION",
+        "NO_ANSWER_OR_KEYWORDS",
+    )
+    blockers = [code for code in blocking if int(counts.get(code) or 0) > 0]
+    return (not blockers), blockers
+
+
+def do_set_latest_eval_baseline(dataset_choice: str | None, force: bool = False):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    latest = _latest_eval_run(dataset_id)
+    if not latest:
+        return "\u5f53\u524d\u8bc4\u6d4b\u96c6\u6682\u65e0 RUN\uff0c\u65e0\u6cd5\u8bbe\u7f6e baseline\u3002", _eval_baseline_compare_rows(dataset_id)
+    latest_dataset_id = int(latest.get("dataset_id") or 0)
+    if not force:
+        is_clean, blockers = _eval_dataset_blocking_issues(latest_dataset_id)
+        if not is_clean:
+            names = "\u3001".join(blockers)
+            return (
+                "\u26a0 \u6570\u636e\u96c6\u5b58\u5728\u963b\u585e\u9879\uff08"
+                + names
+                + "\uff09\uff0c\u8bf7\u5148\u5728\u300c\u6570\u636e\u96c6\u6cbb\u7406\u300d\u9762\u677f\u5904\u7406\u540e\u518d\u8bbe baseline\u3002",
+                _eval_baseline_compare_rows(latest_dataset_id),
+            )
+    run_id = int(latest.get("id") or 0)
+    baselines = _load_eval_baselines()
+    baselines[str(latest_dataset_id)] = run_id
+    _save_eval_baselines(baselines)
+    suffix = " (\u5f3a\u5236\u8986\u76d6)" if force else ""
+    return "\u5df2\u5c06 RUN#" + str(run_id) + " \u8bbe\u4e3a dataset #" + str(latest_dataset_id) + " \u7684 baseline" + suffix + "\u3002", _eval_baseline_compare_rows(latest_dataset_id)
+
+def do_ollama_health_check():
+    return ollama_health_rows(ollama_health_snapshot(str(cfg.ollama.get("base_url") or "")))
+
+
+def _latest_eval_run_id(dataset_id: int | None = None) -> int | None:
+    for run in store.list_eval_runs(limit=100):
+        if dataset_id is None or int(run.get("dataset_id") or 0) == int(dataset_id):
+            rid = int(run.get("id") or 0)
+            return rid if rid > 0 else None
+    return None
+
+
+def do_export_latest_eval_report(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    run_id = _latest_eval_run_id(dataset_id)
+    if run_id is None:
+        return None
+    return str(write_eval_run_report(store, run_id, cfg.data_dir / "exports"))
+
+
+def do_export_latest_eval_case_compare(dataset_choice: str | None):
+    """导出「原题字段 + 评测结果」逐题对比表（xlsx，附 csv）。"""
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    run_id = _latest_eval_run_id(dataset_id)
+    if run_id is None:
+        return None
+    return str(write_eval_case_compare(store, run_id, cfg.data_dir / "exports"))
+
+
+def do_run_retrieval_regression(dataset_choice: str | None):
+    # 真实召回口径：retrieval-only + anchoring OFF；切片取自索引 manifest
+    out = do_run_eval_dataset(
+        dataset_choice,
+        f"retrieval regression {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        str(cfg.prompt.get("system_default", "")).strip(),
+        3,
+        1,
+        False,
+        None,
+        None,
+        None,
+        str(cfg.ollama.get("llm_model") or ""),
+        2048,
+        str(cfg.ollama.get("embed_model") or ""),
+        "retrieval_only",
+        "hybrid",
+        False,
+    )
+    try:
+        status, result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = out
+        summary_map = {str(k): v for k, v in summary_rows}
+        candidate_rate = str(summary_map.get("Candidate hit rate") or summary_map.get("候选命中率") or "-")
+        context_rate = str(summary_map.get("Context hit rate") or summary_map.get("最终上下文命中率") or "-")
+        status = (
+            str(status)
+            + "\n\n[Regression gate] retrieval-only baseline complete. "
+            + f"candidate_hit_rate={candidate_rate}; context_hit_rate={context_rate}. "
+            + "若低于上一条稳定基线，请优先查看归因表和失败样本详情。"
+        )
+        return status, result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
+    except Exception:
+        return out
 
 
 def do_batch_replay(
@@ -1815,6 +2414,8 @@ def do_batch_replay(
     llm_model: str,
     llm_num_ctx: float,
     embed_model: str,
+    generation_mode: str = "llm",
+    retrieval_mode: str = "hybrid",
 ):
     eng = _lazy_engine()
     questions = [line.strip() for line in str(raw_questions or "").splitlines() if line.strip()]
@@ -1822,14 +2423,18 @@ def do_batch_replay(
         return "没有可回放的问题。请按“每行一个问题”输入。", [["（暂无结果）", "—", 0, 0, "—", "—"]], gr.update()
 
     em = (embed_model or "").strip() or None
-    lm = (llm_model or "").strip() or None
+    generation_mode = normalize_generation_mode(generation_mode, llm_model)
+    retrieval_only = generation_mode == "retrieval_only"
+    lm = effective_llm_model(llm_model, generation_mode)
+    retrieval_mode = normalize_retrieval_mode(retrieval_mode)
+    vector_enabled, keyword_enabled = retrieval_flags(retrieval_mode)
     try:
         nctx = int(round(float(llm_num_ctx)))
     except (TypeError, ValueError):
         nctx = 16384
     nctx = max(2048, min(nctx, 262144))
     top_n = max(1, int(top_n))
-    top_k = max(1, min(int(top_k), top_n))
+    top_k = max(1, int(top_k))
     cm = (chunk_mode or "sentence").strip().lower()
 
     index = eng.get_index(cfg, embed_model=em)
@@ -1851,10 +2456,22 @@ def do_batch_replay(
 
     for i, qtext in enumerate(questions, start=1):
         lines.append(f"[{i}/{len(questions)}] {qtext}")
-        nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
-        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
-        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec_filtered, top_k, bool(use_rerank))
+        retrieval_result = eng.hybrid_retrieve(
+            cfg,
+            index,
+            qtext,
+            top_n,
+            top_k,
+            bool(use_rerank),
+            excluded_files,
+            vector_enabled=vector_enabled,
+            keyword_enabled=keyword_enabled,
+        )
+        vector_diag = eng.nodes_to_source_dicts(retrieval_result.vector_nodes, "vector")
+        keyword_diag = eng.nodes_to_source_dicts(retrieval_result.keyword_nodes, "keyword")
+        merged_diag = eng.nodes_to_source_dicts(retrieval_result.merged_nodes, "hybrid")
+        excluded_candidate_count = retrieval_result.excluded_candidate_count
+        nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
         nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
             cfg,
             qtext,
@@ -1866,6 +2483,8 @@ def do_batch_replay(
         diag_payload = _retrieval_diag_payload(
             query=qtext,
             vector_candidates=vector_diag,
+            keyword_candidates=keyword_diag,
+            merged_candidates=merged_diag,
             final_sources=sources,
             top_n=top_n,
             top_k=top_k,
@@ -1875,9 +2494,11 @@ def do_batch_replay(
             excluded_doc_classes=excluded_doc_classes,
             include_zero_chunk=include_zero_chunk,
             excluded_candidate_count=excluded_candidate_count,
+            retrieval_mode=retrieval_mode,
         )
         diag_payload["context_selected_count"] = len(nodes_for_answer)
         diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
         diag_payload["index_state"] = dict(index_state)
         diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
         params = eng.build_params_snapshot(
@@ -1894,6 +2515,16 @@ def do_batch_replay(
             excluded_files=excluded_files,
             excluded_doc_classes=excluded_doc_classes,
             include_zero_chunk=include_zero_chunk,
+            vector_enabled=vector_enabled,
+            keyword_enabled=keyword_enabled,
+            generation_mode=generation_mode,
+            prefer_index_chunk_params=True,
+            retrieval_degraded=bool(retrieval_result.retrieval_degraded),
+            vector_error=str(retrieval_result.vector_error or ""),
+        )
+        diag_payload["retrieval_degraded"] = bool(retrieval_result.retrieval_degraded)
+        diag_payload["requested_retrieval_mode"] = str(
+            getattr(retrieval_result, "requested_retrieval_mode", retrieval_mode) or retrieval_mode
         )
 
         if not nodes_for_answer:
@@ -1901,13 +2532,19 @@ def do_batch_replay(
                 "**根据已知材料无法回答。**\n\n"
                 "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
             )
+        elif retrieval_only:
+            answer = eval_judge.ANSWER_RETRIEVAL_ONLY
         else:
             parts: list[str] = []
-            for token in eng.stream_answer(
-                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
-            ):
-                parts.append(token)
-            answer = "".join(parts).strip() or "（模型未返回正文）"
+            try:
+                for token in eng.stream_answer(
+                    cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
+                ):
+                    parts.append(token)
+                answer = "".join(parts).strip() or "（模型未返回正文）"
+            except Exception as exc:
+                answer = f"生成失败：{type(exc).__name__}: {exc}"
+                diag_payload["generation_error"] = answer
         qa_id = store.insert_qa(
             question=qtext,
             answer=answer,
@@ -1920,14 +2557,16 @@ def do_batch_replay(
             [
                 qtext,
                 "命中" if nodes_for_answer else "未命中",
-                len(nodes_vec),
+                len(retrieval_result.merged_nodes),
                 len(nodes_for_answer),
                 str(sources[0].get("file_name") or "—") if sources else "—",
                 qa_id,
             ]
         )
         lines.append(
-            f"    候选 {len(nodes_vec)} 条，送入上下文 {len(nodes_for_answer)} 条，已入库 QA#{qa_id}。"
+            f"    Hybrid candidates {len(retrieval_result.merged_nodes)} "
+            f"(vector {len(retrieval_result.vector_nodes)} / keyword {len(retrieval_result.keyword_nodes)}), "
+            f"context {len(nodes_for_answer)}, QA#{qa_id}."
         )
 
     if not result_rows:
@@ -1987,7 +2626,17 @@ def _pick_eval_field(row: dict[str, Any], *names: str) -> Any:
 def _parse_eval_cases_from_file(file_obj: Any) -> list[dict[str, Any]]:
     if not file_obj:
         return []
-    path = Path(getattr(file_obj, "name", file_obj))
+    # Path.name 只有文件名会丢目录；优先用完整路径
+    if isinstance(file_obj, Path):
+        path = file_obj
+    else:
+        raw = getattr(file_obj, "name", file_obj)
+        path = Path(str(raw))
+        # Gradio 临时文件通常是绝对路径；若仅有文件名则再试原对象字符串
+        if not path.is_file() and not path.is_absolute():
+            alt = Path(str(file_obj))
+            if alt.is_file():
+                path = alt
     if not path.is_file():
         return []
     suffix = path.suffix.lower()
@@ -2115,57 +2764,18 @@ def _eval_dataset_summary_markdown(dataset_id: int | None) -> str:
     if dataset is None:
         return "未找到评测集。"
     cases = store.fetch_eval_cases(dataset_id)
-    file_expect_count = sum(1 for x in cases if x.get("expected_file_names"))
-    keyword_count = sum(1 for x in cases if x.get("expected_answer_keywords"))
-    abstain_count = sum(1 for x in cases if bool(x.get("allow_abstain")))
+    quality = dataset_quality_summary(cases, resolve_expected_file_details=_resolve_expected_eval_file_details)
+    issue_counts = quality.get("issue_counts") or {}
+    top_issues = ", ".join(
+        f"{k}:{v}" for k, v in sorted(issue_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:8]
+    ) or "none"
     return (
         f"评测集：`{dataset.get('name')}`\n\n"
-        f"样本数：`{len(cases)}` 题；含期望文件：`{file_expect_count}` 题；"
-        f"含答案关键词：`{keyword_count}` 题；拒答样本：`{abstain_count}` 题。"
+        f"样本数：`{len(cases)}`；期望文件：`{quality.get('file_expected_count')}`；"
+        f"期望片段：`{quality.get('chunk_expected_count')}`；答案关键词：`{quality.get('keyword_expected_count')}`；"
+        f"拒答样本：`{quality.get('abstain_count')}`。\n\n"
+        f"Dataset quality issues: `{top_issues}`."
     )
-
-
-def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
-    try:
-        cases = _parse_eval_cases_from_file(file_obj)
-    except Exception as e:
-        msg = f"导入失败：{type(e).__name__}: {e}"
-        if "openpyxl" in str(e).lower():
-            msg += "。当前环境缺少 Excel 依赖，请在项目 .venv 中重新安装 requirements.txt。"
-        choices, value = _eval_dataset_choices()
-        return (
-            msg,
-            gr.update(choices=choices, value=value),
-            [[0, "（暂无样本）", "", "", "", "", ""]],
-            "未导入评测集。",
-        )
-    if not cases:
-        choices, value = _eval_dataset_choices()
-        return (
-            "导入失败：文件里没有有效样本；至少需要 question 字段。",
-            gr.update(choices=choices, value=value),
-            [[0, "（暂无样本）", "", "", "", "", ""]],
-            "未导入评测集。",
-        )
-    name = str(dataset_name or "").strip()
-    if not name:
-        name = Path(getattr(file_obj, "name", file_obj)).stem
-    dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
-    choices, _ = _eval_dataset_choices()
-    choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
-    return (
-        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
-        gr.update(choices=choices, value=choice_value),
-        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
-        _eval_dataset_summary_markdown(dataset_id),
-    )
-
-
-def do_eval_dataset_select(dataset_choice: str | None):
-    dataset_id = _parse_eval_dataset_id(dataset_choice)
-    if dataset_id is None:
-        return "未选择评测集。", [[0, "（暂无样本）", "", "", "", "", ""]]
-    return _eval_dataset_summary_markdown(dataset_id), _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id))
 
 
 def _normalize_eval_text(text: Any) -> str:
@@ -2194,21 +2804,187 @@ def _eval_filename_alias_keys(text: Any) -> set[str]:
     return {k for v in variants if v and (k := _normalize_eval_filename_key(v))}
 
 
+def _eval_filename_text_variants(text: Any) -> set[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    variants = {raw}
+    variants.update(x.strip() for x in re.findall(r"《([^》]+)》", raw) if x.strip())
+    for part in re.split(r"\s*(?:[/／|,，;；、]|\bor\b|或)\s*", raw, flags=re.IGNORECASE):
+        part = str(part or "").strip()
+        cleaned = part.strip("《》\"'“”‘’()（）[]【】")
+        if part:
+            variants.add(part)
+        if cleaned:
+            variants.add(cleaned)
+    return {x for x in variants if x}
+
+
+def _eval_file_alias_path() -> Path:
+    return cfg.data_dir / "eval_file_aliases.json"
+
+
+def _load_eval_file_alias_entries() -> list[dict[str, str]]:
+    path = _eval_file_alias_path()
+    payload = _load_json_or_backup(path)
+    if payload is None:
+        return []
+    raw_entries = payload.get("aliases") if isinstance(payload, dict) else payload
+    out: list[dict[str, str]] = []
+    if isinstance(raw_entries, dict):
+        raw_entries = [{"alias": k, "target_file": v} for k, v in raw_entries.items()]
+    for item in raw_entries or []:
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get("alias") or item.get("raw") or "").strip()
+        target = Path(str(item.get("target_file") or item.get("target") or "")).name.strip()
+        if alias and target:
+            out.append({"alias": alias, "target_file": target})
+    return out
+
+
+def _save_eval_file_alias_entries(entries: list[dict[str, str]]) -> None:
+    path = _eval_file_alias_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dedup: dict[str, dict[str, str]] = {}
+    for item in entries:
+        alias = str(item.get("alias") or "").strip()
+        target = Path(str(item.get("target_file") or "")).name.strip()
+        if alias and target:
+            dedup[_normalize_eval_text(alias)] = {"alias": alias, "target_file": target}
+    payload = {"aliases": sorted(dedup.values(), key=lambda x: _normalize_eval_text(x["alias"]))}
+    _atomic_write_json(path, payload)
+
+
+def _eval_alias_lookup_keys(text: Any) -> set[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    keys = {raw.lower(), _normalize_eval_text(raw), _normalize_eval_filename_key(raw)}
+    keys.update(_candidate_eval_filename_keys(raw))
+    return {k for k in keys if k}
+
+
+def _longest_common_substring_len(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    if len(a) > len(b):
+        a, b = b, a
+    prev = [0] * (len(a) + 1)
+    best = 0
+    for ch_b in b:
+        cur = [0] * (len(a) + 1)
+        for i, ch_a in enumerate(a, start=1):
+            if ch_a == ch_b:
+                cur[i] = prev[i - 1] + 1
+                if cur[i] > best:
+                    best = cur[i]
+        prev = cur
+    return best
+
+
+def _eval_file_alias_key_map(disk_files: list[str]) -> dict[str, set[str]]:
+    disk_by_lower = {Path(name).name.lower(): Path(name).name for name in disk_files if str(name or "").strip()}
+    out: dict[str, set[str]] = {}
+    for item in _load_eval_file_alias_entries():
+        target = Path(str(item.get("target_file") or "")).name
+        target_lower = target.lower()
+        if target_lower not in disk_by_lower:
+            continue
+        for key in _eval_alias_lookup_keys(item.get("alias")):
+            out.setdefault(key, set()).add(target_lower)
+    return out
+
+
+def _uploaded_eval_file_names() -> list[str]:
+    return [str(x.get("name") or "").strip() for x in uploaded_files_snapshot(cfg) if str(x.get("name") or "").strip()]
+
+
 def _candidate_eval_filename_keys(name: str) -> set[str]:
     raw = str(name or "").strip()
     if not raw:
         return set()
-    base = Path(raw).name
-    stem = Path(base).stem
-    keys = {
-        str(base).strip().lower(),
-        _normalize_eval_text(base),
-        _normalize_eval_filename_key(base),
-        _normalize_eval_text(stem),
-        _normalize_eval_filename_key(stem),
-    }
-    keys.update(_eval_filename_alias_keys(base))
+    keys: set[str] = set()
+    for variant in _eval_filename_text_variants(raw):
+        base = Path(variant).name
+        stem = Path(base).stem
+        keys.update(
+            {
+                str(base).strip().lower(),
+                _normalize_eval_text(base),
+                _normalize_eval_filename_key(base),
+                _normalize_eval_text(stem),
+                _normalize_eval_filename_key(stem),
+            }
+        )
+        keys.update(_eval_filename_alias_keys(base))
     return {k for k in keys if k}
+
+
+def _suggest_expected_eval_file_candidates(raw: str, disk_files: list[str]) -> list[dict[str, Any]]:
+    expected = str(raw or "").strip()
+    expected_keys = _candidate_eval_filename_keys(expected)
+    expected_variants = _eval_filename_text_variants(expected)
+    expected_norms = {_normalize_eval_filename_key(x) for x in expected_variants}
+    expected_stems = {_normalize_eval_filename_key(Path(x).stem) for x in expected_variants}
+    expected_norms = {x for x in expected_norms if x}
+    expected_stems = {x for x in expected_stems if x}
+    suggestions: list[dict[str, Any]] = []
+
+    for file_name in disk_files:
+        candidate_keys = _candidate_eval_filename_keys(file_name)
+        candidate_norm = _normalize_eval_filename_key(file_name)
+        candidate_stem = _normalize_eval_filename_key(Path(file_name).stem)
+        reasons: list[str] = []
+        score = 0.0
+
+        if expected_keys & candidate_keys:
+            score = max(score, 1.0)
+            reasons.append("别名/规范化键一致")
+        for expected_norm in expected_norms:
+            if expected_norm and candidate_norm:
+                if expected_norm in candidate_norm or candidate_norm in expected_norm:
+                    score = max(score, 0.92)
+                    reasons.append("文件名包含关系")
+                common_len = _longest_common_substring_len(expected_norm, candidate_norm)
+                if common_len >= 6:
+                    score = max(score, min(0.88, 0.58 + common_len * 0.025))
+                    reasons.append("长公共片段")
+                score = max(score, difflib.SequenceMatcher(None, expected_norm, candidate_norm).ratio() * 0.86)
+        for expected_stem in expected_stems:
+            if expected_stem and candidate_stem:
+                if expected_stem in candidate_stem or candidate_stem in expected_stem:
+                    score = max(score, 0.9)
+                    reasons.append("主文件名包含关系")
+                common_len = _longest_common_substring_len(expected_stem, candidate_stem)
+                if common_len >= 6:
+                    score = max(score, min(0.88, 0.58 + common_len * 0.025))
+                    reasons.append("主文件名长公共片段")
+                score = max(score, difflib.SequenceMatcher(None, expected_stem, candidate_stem).ratio() * 0.88)
+
+        if score >= 0.58:
+            suggestions.append(
+                {
+                    "file": file_name,
+                    "score": round(float(score), 3),
+                    "reason": "、".join(dict.fromkeys(reasons)) or "名称相似",
+                }
+            )
+
+    suggestions.sort(key=lambda x: (-float(x.get("score") or 0), str(x.get("file") or "")))
+    return suggestions[:3]
+
+
+def _format_eval_file_suggestions(suggestions: list[dict[str, Any]]) -> str:
+    if not suggestions:
+        return "-"
+    parts = []
+    for item in suggestions[:3]:
+        file_name = str(item.get("file") or "")
+        score = float(item.get("score") or 0)
+        reason = str(item.get("reason") or "名称相似")
+        parts.append(f"{file_name} ({score:.2f}, {reason})")
+    return " | ".join(parts) or "-"
 
 
 def _resolve_expected_eval_file_details(expected_values: list[Any]) -> dict[str, Any]:
@@ -2220,12 +2996,14 @@ def _resolve_expected_eval_file_details(expected_values: list[Any]) -> dict[str,
             "resolved_files": [],
             "unresolved_files": [],
             "ambiguous_files": [],
+            "suggestions": [],
             "has_unresolved": False,
             "has_ambiguous": False,
         }
-    disk_files = [str(x.get("name") or "").strip() for x in uploaded_files_snapshot(cfg) if str(x.get("name") or "").strip()]
+    disk_files = _uploaded_eval_file_names()
     disk_set = {name.lower() for name in disk_files}
     disk_key_map: dict[str, set[str]] = {}
+    alias_key_map = _eval_file_alias_key_map(disk_files)
 
     def _add_key(key: str, target: str) -> None:
         if not key:
@@ -2241,12 +3019,15 @@ def _resolve_expected_eval_file_details(expected_values: list[Any]) -> dict[str,
     resolved_set: set[str] = set()
     unresolved: list[str] = []
     ambiguous: list[dict[str, Any]] = []
+    suggestions: list[dict[str, Any]] = []
     for raw in raw_values:
         lowered = raw.lower()
         matched: set[str] = set()
         if lowered in disk_set:
             matched.add(lowered)
         else:
+            for key in _eval_alias_lookup_keys(raw):
+                matched.update(alias_key_map.get(key) or set())
             for key in _candidate_eval_filename_keys(raw):
                 matched.update(disk_key_map.get(key) or set())
         matched_sorted = sorted(matched)
@@ -2257,13 +3038,16 @@ def _resolve_expected_eval_file_details(expected_values: list[Any]) -> dict[str,
             ambiguous.append({"raw": raw, "matches": matched_sorted})
             details.append({"raw": raw, "matches": matched_sorted, "status": "ambiguous"})
         else:
+            raw_suggestions = _suggest_expected_eval_file_candidates(raw, disk_files)
             unresolved.append(raw)
-            details.append({"raw": raw, "matches": [], "status": "unresolved"})
+            suggestions.append({"raw": raw, "candidates": raw_suggestions})
+            details.append({"raw": raw, "matches": [], "status": "unresolved", "suggestions": raw_suggestions})
     return {
         "raw_values": raw_values,
         "resolved_files": sorted(resolved_set),
         "unresolved_files": unresolved,
         "ambiguous_files": ambiguous,
+        "suggestions": suggestions,
         "has_unresolved": bool(unresolved),
         "has_ambiguous": bool(ambiguous),
         "details": details,
@@ -2309,30 +3093,44 @@ def _file_list_hits_expected(file_names: list[str], expected_names: set[str], ex
     return any(_eval_filename_matches_expected(name, expected_names, expected_raw_values) for name in file_names)
 
 
-def _text_match_loose(expect_text: str, actual_text: str) -> bool:
-    a = _normalize_eval_text(expect_text)
-    b = _normalize_eval_text(actual_text)
-    if not a or not b:
-        return False
-    if a in b or b in a:
-        return True
-    ratio = difflib.SequenceMatcher(None, a[:4000], b[:4000]).ratio()
-    if ratio >= 0.6:
-        return True
-    if len(a) >= 20 and len(b) >= 20:
-        short = a if len(a) <= len(b) else b
-        long = b if len(a) <= len(b) else a
-        common = 0
-        for i in range(0, max(1, len(short) - 7), 8):
-            seg = short[i : i + 24]
-            if seg and seg in long:
-                common = max(common, len(seg))
-        if common >= 24 and ratio >= 0.35:
-            return True
-    return False
-
-
 def _is_abstain_answer(answer: str) -> bool:
+
+    return eval_judge.is_abstain_answer(answer)
+
+
+
+
+
+def _text_match_loose(expect_text: str, actual_text: str) -> bool:
+
+    return eval_judge.text_match_loose(expect_text, actual_text)
+
+
+
+
+
+def _chunk_match_metrics(expect_text: str, actual_text: str) -> dict[str, Any]:
+
+    return eval_judge.chunk_match_metrics(expect_text, actual_text)
+
+
+
+
+
+def _chunk_match_diagnostics(
+
+    expected_chunk: str,
+
+    candidates: list[dict[str, Any]],
+
+    sources: list[dict[str, Any]],
+
+) -> dict[str, Any]:
+
+    return eval_judge.chunk_match_diagnostics(expected_chunk, candidates, sources)
+
+
+
     s = str(answer or "")
     return ("无法回答" in s) or ("未检索到任何文档片段" in s)
 
@@ -2342,83 +3140,27 @@ def _evaluate_case_result(
     vector_diag: list[dict[str, Any]],
     sources: list[dict[str, Any]],
     answer: str,
+    *,
+    final_ranked_sources: list[dict[str, Any]] | None = None,
+    use_rerank: bool = False,
+    context_truncated: bool = False,
+    generation_mode: str | None = None,
+    no_context: bool | None = None,
 ) -> dict[str, Any]:
     expected_raw_files = [str(x).strip() for x in (case.get("expected_file_names") or []) if str(x).strip()]
     expected_info = _resolve_expected_eval_file_details(expected_raw_files)
-    expected_files = set(expected_info.get("resolved_files") or [])
-    candidate_file_list = [str(x.get("file_name") or "").strip() for x in vector_diag if str(x.get("file_name") or "").strip()]
-    context_file_list = [str(x.get("file_name") or "").strip() for x in sources if str(x.get("file_name") or "").strip()]
-    candidate_hit = _file_list_hits_expected(candidate_file_list, expected_files, expected_raw_files)
-    context_hit = _file_list_hits_expected(context_file_list, expected_files, expected_raw_files)
-    expected_chunk = str(case.get("expected_chunk_content") or "").strip()
-    chunk_hit: bool | None = None
-    if expected_chunk:
-        chunk_hit = any(_text_match_loose(expected_chunk, str(x.get("chunk") or "")) for x in sources)
-
-    expected_answer = _normalize_eval_text(case.get("expected_answer"))
-    answer_norm = _normalize_eval_text(answer)
-    keywords = [_normalize_eval_text(x) for x in (case.get("expected_answer_keywords") or []) if _normalize_eval_text(x)]
-    answer_hit: bool | None = None
-    if keywords:
-        answer_hit = all(k in answer_norm for k in keywords)
-    elif expected_answer:
-        answer_hit = expected_answer in answer_norm
-
-    abstain_expected = bool(case.get("allow_abstain"))
-    abstain_actual = _is_abstain_answer(answer)
-    abstain_correct = abstain_actual == abstain_expected
-
-    matched_candidates = [
-        name for name in candidate_file_list if _eval_filename_matches_expected(name, expected_files, expected_raw_files)
-    ]
-    filtered_out = bool(candidate_file_list) and not bool(context_file_list) and candidate_hit is True and context_hit is False
-    target_file_hit_but_chunk_miss = bool(context_hit is True and expected_chunk and chunk_hit is False)
-    issue_codes: list[str] = []
-    if bool(expected_info.get("has_unresolved")):
-        issue_codes.append("EXPECTED_FILE_UNRESOLVED")
-    if bool(expected_info.get("has_ambiguous")):
-        issue_codes.append("EXPECTED_FILE_AMBIGUOUS")
-    if filtered_out:
-        issue_codes.append("FILTERED_OUT")
-    if candidate_hit is False:
-        issue_codes.append("TARGET_FILE_MISS")
-    if target_file_hit_but_chunk_miss:
-        issue_codes.append("TARGET_FILE_HIT_BUT_CHUNK_MISS")
-    if abstain_expected and not abstain_correct:
-        issue_codes.append("ANSWERED_WHEN_SHOULD_ABSTAIN")
-
-    if abstain_expected:
-        error_type = "OK" if abstain_correct else "ANSWERED_WHEN_SHOULD_ABSTAIN"
-    elif bool(expected_info.get("has_unresolved")):
-        error_type = "EXPECTED_FILE_UNRESOLVED"
-    elif bool(expected_info.get("has_ambiguous")):
-        error_type = "EXPECTED_FILE_AMBIGUOUS"
-    elif candidate_hit is False:
-        error_type = "TARGET_FILE_MISS"
-    elif filtered_out:
-        error_type = "FILTERED_OUT"
-    elif target_file_hit_but_chunk_miss:
-        error_type = "TARGET_FILE_HIT_BUT_CHUNK_MISS"
-    elif context_hit is False:
-        error_type = "RERANK_DROP"
-    else:
-        error_type = "OK"
-
-    return {
-        "candidate_hit": candidate_hit,
-        "context_hit": context_hit,
-        "chunk_hit": chunk_hit,
-        "answer_hit": answer_hit,
-        "abstain_expected": abstain_expected,
-        "abstain_actual": abstain_actual,
-        "abstain_correct": abstain_correct,
-        "error_type": error_type,
-        "issue_codes": issue_codes,
-        "expected_file_resolution": expected_info,
-        "matched_candidate_files": matched_candidates,
-        "filtered_out": filtered_out,
-        "target_file_hit_but_chunk_miss": target_file_hit_but_chunk_miss,
-    }
+    return eval_judge.judge_case(
+        case,
+        vector_diag,
+        sources,
+        answer,
+        final_ranked_sources=final_ranked_sources,
+        use_rerank=use_rerank,
+        context_truncated=context_truncated,
+        expected_file_info=expected_info,
+        generation_mode=generation_mode,
+        no_context=no_context,
+    )
 
 
 def _eval_run_summary_rows() -> list[list[Any]]:
@@ -2426,7 +3168,7 @@ def _eval_run_summary_rows() -> list[list[Any]]:
 
 
 def _empty_eval_result_rows() -> list[list[Any]]:
-    return [[0, "（暂无结果）", "", "", "", "", "", "", "", ""]]
+    return [[0, "（暂无结果）", "", "", "", "", "", "", "", "", ""]]
 
 
 def _empty_eval_summary_rows() -> list[list[Any]]:
@@ -2434,23 +3176,56 @@ def _empty_eval_summary_rows() -> list[list[Any]]:
 
 
 def _eval_case_bucket(case: dict[str, Any]) -> str:
-    expected_files = _resolve_expected_eval_files(case.get("expected_file_names") or [])
-    return "file_eval" if expected_files else "non_file_eval"
+    """file_eval=可解析期望文件；unresolved_file_eval=有标注但未解析；non_file_eval=无文件标注。"""
+    expected_raw = [str(x).strip() for x in (case.get("expected_file_names") or []) if str(x).strip()]
+    if not expected_raw:
+        return "non_file_eval"
+    expected_files = _resolve_expected_eval_files(expected_raw)
+    if expected_files:
+        return "file_eval"
+    return "unresolved_file_eval"
 
 
 def _summary_rows_from_summary(summary: dict[str, Any] | None) -> list[list[Any]]:
     summary = summary or {}
-    return [
-        ["样本数", int(summary.get("case_count") or 0)],
-        ["文件命中可评估题", int(summary.get("file_eval_case_count") or 0)],
-        ["非文件命中题", int(summary.get("non_file_eval_case_count") or 0)],
-        ["候选命中率", summary.get("candidate_hit_rate") or "—"],
-        ["最终上下文命中率", summary.get("context_hit_rate") or "—"],
-        ["目标片段命中率", summary.get("chunk_hit_rate") or "—"],
-        ["答案命中率（参考）", summary.get("answer_hit_rate") or "—"],
-        ["拒答正确率（参考）", summary.get("abstain_accuracy") or "—"],
-        ["OK 数", int(summary.get("ok_count") or 0)],
+    rows = [
+        ["Samples", int(summary.get("case_count") or 0)],
+        ["File-evaluable cases", int(summary.get("file_eval_case_count") or 0)],
+        ["Unresolved expected-file cases", int(summary.get("unresolved_file_case_count") or 0)],
+        ["Labeled file cases", int(summary.get("labeled_file_case_count") or 0)],
+        ["Non-file cases", int(summary.get("non_file_eval_case_count") or 0)],
+        ["Candidate hit rate", summary.get("candidate_hit_rate") or "-"],
+        ["Candidate hit rate (all labeled)", summary.get("candidate_hit_rate_all_labeled") or "-"],
+        ["Context hit rate", summary.get("context_hit_rate") or "-"],
+        ["Context hit rate (all labeled)", summary.get("context_hit_rate_all_labeled") or "-"],
+        ["Chunk hit rate", summary.get("chunk_hit_rate") or "-"],
+        ["Answer hit rate", summary.get("answer_hit_rate") or "-"],
+        ["Abstain accuracy", summary.get("abstain_accuracy") or "-"],
+        ["OK count", int(summary.get("ok_count") or 0)],
     ]
+    if summary.get("generation_mode"):
+        rows.append(["Generation mode", summary.get("generation_mode")])
+    if summary.get("query_anchoring_enabled") is not None:
+        rows.append(["Query anchoring", "on" if summary.get("query_anchoring_enabled") else "off"])
+    if summary.get("retrieval_degraded"):
+        rows.append(["Retrieval degraded", "yes"])
+    if summary.get("chunk_params_mismatch"):
+        rows.append(["Chunk params mismatch", "yes (used index values)"])
+    if summary.get("run_fingerprint"):
+        rows.append(["Run fingerprint", summary.get("run_fingerprint")])
+    issue_counts = ((summary.get("dataset_quality") or {}).get("issue_counts") or {})
+    if issue_counts:
+        rows.append([
+            "Dataset quality issues",
+            ", ".join(f"{k}:{v}" for k, v in sorted(issue_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:6]),
+        ])
+    attr_counts = summary.get("attribution_counts") or {}
+    if attr_counts:
+        rows.append([
+            "Top attribution",
+            ", ".join(f"{k}:{v}" for k, v in sorted(attr_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:6]),
+        ])
+    return rows
 
 
 def _eval_run_summary_rows_for_dataset(dataset_id: int | None) -> list[list[Any]]:
@@ -2493,6 +3268,18 @@ def _empty_eval_tag_rows() -> list[list[Any]]:
     return [["标签", "样本数", "文档命中率", "片段命中率", "答案命中率（参考）", "OK 数"], ["（暂无结果）", 0, "—", "—", "—", 0]]
 
 
+def _empty_eval_file_rows() -> list[list[Any]]:
+    return [["File", "Cases", "Candidate hit", "Context hit", "Chunk hit", "Answer hit", "OK", "Errors"], ["(no results)", 0, "-", "-", "-", "-", 0, "-"]]
+
+
+def _empty_eval_chunk_diag_rows() -> list[list[Any]]:
+    return [["（暂无片段诊断）", "", "", "", "", "", "", "", "", ""]]
+
+
+def _empty_eval_funnel_rows() -> list[list[Any]]:
+    return [["（暂无检索漏斗）", "", "", "", "", "", "", ""]]
+
+
 def _format_eval_rate_from_bools(values: list[bool | None]) -> str:
     filtered = [bool(v) for v in values if v is not None]
     if not filtered:
@@ -2505,36 +3292,32 @@ def _params_rows_from_run(run: dict[str, Any] | None) -> list[list[Any]]:
         return _empty_eval_param_rows()
     params = run.get("params") or {}
     ordered_keys = [
-        ("llm_model", "对话模型"),
-        ("embed_model", "嵌入模型"),
-        ("chunk_mode", "切分策略"),
-        ("chunk_size", "Chunk"),
-        ("chunk_overlap", "Overlap"),
+        ("run_fingerprint", "Run fingerprint"),
+        ("generation_mode", "Generation mode"),
+        ("retrieval_mode", "Retrieval mode"),
+        ("vector_enabled", "Vector enabled"),
+        ("keyword_enabled", "Keyword enabled"),
+        ("llm_model", "LLM model"),
+        ("embed_model", "Embedding model"),
+        ("rerank_model", "Rerank model"),
+        ("chunk_mode", "Chunk mode"),
+        ("chunk_size", "Chunk size"),
+        ("chunk_overlap", "Chunk overlap"),
         ("top_n", "Top-N"),
         ("top_k", "Top-K"),
-        ("use_rerank", "启用重排"),
-        ("query_anchoring_enabled", "查询锚点增强"),
-        ("query_anchoring_source", "锚点来源"),
+        ("use_rerank", "Use rerank"),
+        ("query_anchoring_enabled", "Query anchoring"),
         ("llm_num_ctx", "LLM num_ctx"),
-        ("excluded_doc_classes", "排除分类"),
-        ("include_zero_chunk", "排除 zero-chunk"),
-        ("excluded_file_count", "排除文件数"),
-        ("excluded_file_preview", "排除文件预览"),
-        ("index_snapshot", "索引快照"),
+        ("dataset_quality", "Dataset quality"),
+        ("index_snapshot", "Index snapshot"),
     ]
     rows: list[list[Any]] = []
     for key, label in ordered_keys:
         val = params.get(key)
-        if key == "use_rerank":
-            val = "是" if bool(val) else "否"
-        elif key == "include_zero_chunk":
-            val = "是" if bool(val) else "否"
-        elif isinstance(val, list):
-            val = " / ".join(str(x) for x in val) or "—"
-        elif isinstance(val, dict):
+        if isinstance(val, (dict, list)):
             val = json.dumps(val, ensure_ascii=False)
         elif val in (None, ""):
-            val = "—"
+            val = "-"
         rows.append([label, val])
     return rows or _empty_eval_param_rows()
 
@@ -2551,7 +3334,179 @@ def _eval_error_rows_for_run(run_id: int) -> list[list[Any]]:
     rows = []
     for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         rows.append([key, count, f"{(count / total) * 100:.1f}%"])
+    rows.extend(attribution_rows(results))
     return rows or _empty_eval_error_rows()
+
+
+def _eval_dataset_quality_rows(dataset_id: int | None) -> list[list[Any]]:
+    if dataset_id is None:
+        return dataset_quality_rows(None)
+    cases = store.fetch_eval_cases(dataset_id)
+    summary = dataset_quality_summary(cases, resolve_expected_file_details=_resolve_expected_eval_file_details)
+    return dataset_quality_rows(summary)
+
+
+def _eval_failure_detail_rows(run_id: int | None) -> list[list[Any]]:
+    if run_id is None:
+        return [["（暂无失败样本）", "", "", "", "", "", "", 0]]
+    rows: list[list[Any]] = []
+    for item in store.fetch_eval_case_results(run_id):
+        err = str(item.get("error_type") or "")
+        if err == "OK":
+            continue
+        diag = item.get("diagnostics") or {}
+        eval_diag = diag.get("eval_case_diagnostics") or {}
+        expected = eval_diag.get("expected_file_resolution") or {}
+        unresolved_files = list(expected.get("unresolved_files") or [])
+        suggestion_rows = list(expected.get("suggestions") or [])
+        has_suggestion_candidates = any(list(x.get("candidates") or []) for x in suggestion_rows if isinstance(x, dict))
+        fallback_resolved_files: list[str] = []
+        if unresolved_files and not has_suggestion_candidates:
+            fallback_resolution = _resolve_expected_eval_file_details(unresolved_files)
+            fallback_resolved_files = list(fallback_resolution.get("resolved_files") or [])
+            suggestion_rows = list(fallback_resolution.get("suggestions") or [])
+        suggestion_text = " ; ".join(
+            f"{str(x.get('raw') or '')}: {_format_eval_file_suggestions(list(x.get('candidates') or []))}"
+            for x in suggestion_rows
+        )
+        if not suggestion_text and fallback_resolved_files:
+            suggestion_text = "可解析为: " + " | ".join(str(x) for x in fallback_resolved_files)
+        sources = item.get("sources") or []
+        rows.append(
+            [
+                int(item.get("case_id") or 0),
+                str(item.get("question") or ""),
+                err,
+                str(diag.get("retrieval_attribution") or attribution_code(diagnostics=diag, error_type=err)),
+                " | ".join(str(x) for x in unresolved_files) or "-",
+                suggestion_text or "-",
+                str((sources[0] or {}).get("file_name") or "-") if sources else "-",
+                int(item.get("qa_id") or 0),
+            ]
+        )
+    return rows or [["（暂无失败样本）", "", "", "", "", "", "", 0]]
+
+
+def _first_eval_suggestion_file(suggestions_text: str) -> str:
+    first = str(suggestions_text or "").split("|", 1)[0].strip()
+    if not first or first == "-":
+        return ""
+    return first.split("(", 1)[0].strip()
+
+
+def _eval_file_alias_rows(dataset_id: int | None) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    disk_files = _uploaded_eval_file_names()
+    if dataset_id is not None:
+        counts: dict[str, int] = {}
+        status_by_raw: dict[str, str] = {}
+        target_by_raw: dict[str, str] = {}
+        suggestions_by_raw: dict[str, str] = {}
+        for case in store.fetch_eval_cases(dataset_id):
+            for raw in [str(x).strip() for x in (case.get("expected_file_names") or []) if str(x).strip()]:
+                info = _resolve_expected_eval_file_details([raw])
+                counts[raw] = counts.get(raw, 0) + 1
+                if info.get("resolved_files"):
+                    status_by_raw[raw] = "resolved"
+                    target_by_raw[raw] = " | ".join(str(x) for x in info.get("resolved_files") or [])
+                    suggestions_by_raw[raw] = "-"
+                elif info.get("has_ambiguous"):
+                    status_by_raw[raw] = "ambiguous"
+                    matches = []
+                    for item in info.get("ambiguous_files") or []:
+                        matches.extend(str(x) for x in item.get("matches") or [])
+                    target_by_raw[raw] = " | ".join(sorted(set(matches))) or "-"
+                    suggestions_by_raw[raw] = "-"
+                else:
+                    status_by_raw[raw] = "unresolved"
+                    target_by_raw[raw] = "-"
+                    cand_rows = list((info.get("suggestions") or [{}])[0].get("candidates") or [])
+                    suggestions_by_raw[raw] = _format_eval_file_suggestions(cand_rows)
+        for raw, count in sorted(counts.items(), key=lambda kv: (status_by_raw.get(kv[0]) == "resolved", -kv[1], kv[0])):
+            rows.append([
+                raw,
+                int(count),
+                status_by_raw.get(raw) or "unknown",
+                target_by_raw.get(raw) or "-",
+                suggestions_by_raw.get(raw) or "-",
+                "dataset",
+            ])
+
+    seen_aliases = {_normalize_eval_text(str(r[0])) for r in rows}
+    disk_lower = {Path(x).name.lower() for x in disk_files}
+    for item in _load_eval_file_alias_entries():
+        alias = str(item.get("alias") or "").strip()
+        target = Path(str(item.get("target_file") or "")).name.strip()
+        if not alias:
+            continue
+        status = "saved" if target.lower() in disk_lower else "target_missing"
+        if _normalize_eval_text(alias) in seen_aliases:
+            continue
+        rows.append([alias, "-", status, target or "-", "-", "alias"])
+    return rows or [["（暂无 alias 治理项）", 0, "-", "-", "-", "-"]]
+
+
+def _eval_alias_target_dropdown_update(value: str | None = None):
+    choices = _uploaded_eval_file_names()
+    clean_value = Path(str(value or "")).name.strip()
+    if clean_value not in choices:
+        clean_value = choices[0] if choices else None
+    return gr.update(choices=choices, value=clean_value)
+
+
+def do_eval_alias_row_select(evt: gr.SelectData):
+    if not getattr(evt, "selected", False):
+        return "", gr.update()
+    row_value = getattr(evt, "row_value", None)
+    if not isinstance(row_value, (list, tuple)) or not row_value:
+        return "", gr.update()
+    raw = str(row_value[0] or "").strip()
+    target = str(row_value[3] or "").strip()
+    if not target or target == "-":
+        target = _first_eval_suggestion_file(str(row_value[4] or ""))
+    return raw, _eval_alias_target_dropdown_update(target)
+
+
+def do_save_eval_file_alias(dataset_choice: str | None, alias_raw: str, target_file: str | None):
+    alias = str(alias_raw or "").strip()
+    target = Path(str(target_file or "")).name.strip()
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    disk_files = _uploaded_eval_file_names()
+    if not alias:
+        status = "请先填写或从表格选择 expected raw。"
+    elif target not in disk_files:
+        status = "请选择一个当前 uploads 中存在的目标文件。"
+    else:
+        entries = [x for x in _load_eval_file_alias_entries() if _normalize_eval_text(x.get("alias")) != _normalize_eval_text(alias)]
+        entries.append({"alias": alias, "target_file": target})
+        _save_eval_file_alias_entries(entries)
+        status = f"已保存 alias：{alias} -> {target}"
+    return (
+        status,
+        _eval_dataset_quality_rows(dataset_id),
+        _eval_failure_detail_rows(_latest_eval_run_id(dataset_id)),
+        _eval_file_alias_rows(dataset_id),
+        _eval_alias_target_dropdown_update(target),
+    )
+
+
+def do_delete_eval_file_alias(dataset_choice: str | None, alias_raw: str):
+    alias = str(alias_raw or "").strip()
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    before = _load_eval_file_alias_entries()
+    after = [x for x in before if _normalize_eval_text(x.get("alias")) != _normalize_eval_text(alias)]
+    if alias and len(after) != len(before):
+        _save_eval_file_alias_entries(after)
+        status = f"已删除 alias：{alias}"
+    else:
+        status = "未找到可删除的 alias。"
+    return (
+        status,
+        _eval_dataset_quality_rows(dataset_id),
+        _eval_failure_detail_rows(_latest_eval_run_id(dataset_id)),
+        _eval_file_alias_rows(dataset_id),
+        _eval_alias_target_dropdown_update(),
+    )
 
 
 def _eval_file_bucket_rows_for_run(run: dict[str, Any] | None) -> list[list[Any]]:
@@ -2623,11 +3578,54 @@ def _eval_tag_rows_for_run(run: dict[str, Any] | None) -> list[list[Any]]:
     return rows or _empty_eval_tag_rows()
 
 
+def _eval_file_rows_for_run(run: dict[str, Any] | None) -> list[list[Any]]:
+    if not run:
+        return _empty_eval_file_rows()
+    run_id = int(run.get("id") or 0)
+    dataset_id = int(run.get("dataset_id") or 0)
+    results = store.fetch_eval_case_results(run_id)
+    if not results or dataset_id <= 0:
+        return _empty_eval_file_rows()
+    case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)}
+    bucket: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        case = case_map.get(int(item.get("case_id") or 0), {})
+        names = list(case.get("expected_file_names") or [])
+        if not names:
+            sources = item.get("sources") or []
+            names = [str((sources[0] or {}).get("file_name") or "(no expected file)")] if sources else ["(no expected file)"]
+        for name in names:
+            bucket.setdefault(str(name or "(blank)"), []).append(item)
+    rows: list[list[Any]] = []
+    for name, items in sorted(bucket.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        err_counts: dict[str, int] = {}
+        for item in items:
+            err = str(item.get("error_type") or "UNKNOWN")
+            if err != "OK":
+                err_counts[err] = err_counts.get(err, 0) + 1
+        err_s = ", ".join(f"{k}:{v}" for k, v in sorted(err_counts.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
+        rows.append([
+            name,
+            len(items),
+            _format_eval_rate_from_bools([x.get("candidate_hit") for x in items]),
+            _format_eval_rate_from_bools([x.get("context_hit") for x in items]),
+            _format_eval_rate_from_bools([x.get("chunk_hit") for x in items]),
+            _format_eval_rate_from_bools([x.get("answer_hit") for x in items]),
+            sum(1 for x in items if str(x.get("error_type") or "") == "OK"),
+            err_s,
+        ])
+    return rows or _empty_eval_file_rows()
+
+
 def _eval_result_rows_for_run(run_id: int) -> list[list[Any]]:
     results = store.fetch_eval_case_results(run_id)
     rows: list[list[Any]] = []
     for idx, item in enumerate(results, start=1):
         sources = item.get("sources") or []
+        diag = item.get("diagnostics") or {}
+        attribution = str(
+            diag.get("retrieval_attribution") or attribution_code(diagnostics=diag, error_type=item.get("error_type"))
+        )
         rows.append(
             [
                 idx,
@@ -2638,11 +3636,98 @@ def _eval_result_rows_for_run(run_id: int) -> list[list[Any]]:
                 "命中" if item.get("answer_hit") else ("—" if item.get("answer_hit") is None else "未命中"),
                 "正确" if item.get("abstain_correct") else "错误",
                 str(item.get("error_type") or ""),
+                attribution,
                 str((sources[0] or {}).get("file_name") or "—") if sources else "—",
                 item.get("qa_id") or "",
             ]
         )
     return rows or _empty_eval_result_rows()
+
+
+def _eval_chunk_diag_rows_for_run(run_id: int | None) -> list[list[Any]]:
+    if run_id is None:
+        return _empty_eval_chunk_diag_rows()
+    run = _eval_run_by_id(run_id)
+    dataset_id = int((run or {}).get("dataset_id") or 0)
+    case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)} if dataset_id > 0 else {}
+    rows: list[list[Any]] = []
+    for item in store.fetch_eval_case_results(run_id):
+        diag = item.get("diagnostics") or {}
+        eval_diag = diag.get("eval_case_diagnostics") or {}
+        chunk_diag = eval_diag.get("chunk_diagnostics") or {}
+        if not chunk_diag.get("has_expected_chunk"):
+            case = case_map.get(int(item.get("case_id") or 0), {})
+            chunk_diag = _chunk_match_diagnostics(
+                str(case.get("expected_chunk_content") or ""),
+                list(diag.get("merged_candidates") or []),
+                list(diag.get("final_sources") or item.get("sources") or []),
+            )
+        if not chunk_diag.get("has_expected_chunk"):
+            continue
+        best = dict(chunk_diag.get("best") or {})
+        rows.append(
+            [
+                int(item.get("case_id") or 0),
+                str(item.get("error_type") or ""),
+                "命中" if item.get("chunk_hit") else "未命中",
+                str(best.get("stage") or "-"),
+                int(best.get("rank") or 0),
+                str(best.get("file_name") or "-"),
+                f"{float(best.get('similarity') or 0):.3f}",
+                f"{float(best.get('coverage') or 0) * 100:.1f}%",
+                int(best.get("common_chars") or 0),
+                str(best.get("preview") or ""),
+            ]
+        )
+    rows.sort(key=lambda r: (r[2] == "命中", -int(r[8] or 0), int(r[0] or 0)))
+    return rows or _empty_eval_chunk_diag_rows()
+
+
+def _stage_file_names(items: list[dict[str, Any]]) -> list[str]:
+    return [str(x.get("file_name") or "").strip() for x in items if str(x.get("file_name") or "").strip()]
+
+
+def _format_top_files(items: list[dict[str, Any]], limit: int = 3) -> str:
+    names: list[str] = []
+    for item in items[:limit]:
+        name = str(item.get("file_name") or "").strip()
+        if name:
+            names.append(name)
+    return " | ".join(names) or "-"
+
+
+def _eval_funnel_rows_for_run(run_id: int | None) -> list[list[Any]]:
+    if run_id is None:
+        return _empty_eval_funnel_rows()
+    rows: list[list[Any]] = []
+    for item in store.fetch_eval_case_results(run_id):
+        diag = item.get("diagnostics") or {}
+        eval_diag = diag.get("eval_case_diagnostics") or {}
+        expected = eval_diag.get("expected_file_resolution") or {}
+        expected_files = set(expected.get("resolved_files") or [])
+        expected_raw = list(expected.get("raw_values") or [])
+        stages = [
+            ("vector", list(diag.get("vector_candidates") or [])),
+            ("keyword", list(diag.get("keyword_candidates") or [])),
+            ("merged", list(diag.get("merged_candidates") or [])),
+            ("final_ranked", list(diag.get("final_ranked_contexts") or [])),
+            ("context", list(diag.get("final_sources") or item.get("sources") or [])),
+        ]
+        for stage, items in stages:
+            hit = _file_list_hits_expected(_stage_file_names(items), expected_files, expected_raw)
+            rows.append(
+                [
+                    int(item.get("case_id") or 0),
+                    stage,
+                    len(items),
+                    "命中" if hit else ("—" if hit is None else "未命中"),
+                    " | ".join(str(x) for x in expected.get("unresolved_files") or []) or "-",
+                    _format_top_files(items),
+                    str(item.get("error_type") or ""),
+                    int(item.get("qa_id") or 0),
+                ]
+            )
+    return rows or _empty_eval_funnel_rows()
 
 
 def _eval_run_dashboard_outputs(dataset_id: int | None, run_id: int | None = None):
@@ -2655,6 +3740,9 @@ def _eval_run_dashboard_outputs(dataset_id: int | None, run_id: int | None = Non
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
         )
     run_rows = store.list_eval_runs(limit=200)
     run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
@@ -2663,7 +3751,10 @@ def _eval_run_dashboard_outputs(dataset_id: int | None, run_id: int | None = Non
     param_rows = _params_rows_from_run(run)
     error_rows = _eval_error_rows_for_run(run_id)
     tag_rows = _eval_tag_rows_for_run(run)
-    return summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows
+    file_rows = _eval_file_rows_for_run(run)
+    chunk_diag_rows = _eval_chunk_diag_rows_for_run(run_id)
+    funnel_rows = _eval_funnel_rows_for_run(run_id)
+    return summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
 
 
 def _finalize_eval_run_summary(run_id: int) -> list[list[Any]]:
@@ -2672,8 +3763,16 @@ def _finalize_eval_run_summary(run_id: int) -> list[list[Any]]:
     run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
     dataset_id = int((run or {}).get("dataset_id") or 0)
     case_map = {int(x["id"]): x for x in store.fetch_eval_cases(dataset_id)} if dataset_id > 0 else {}
-    file_eval_results = [x for x in results if _eval_case_bucket(case_map.get(int(x.get("case_id") or 0), {})) == "file_eval"]
-    non_file_eval_results = [x for x in results if _eval_case_bucket(case_map.get(int(x.get("case_id") or 0), {})) != "file_eval"]
+    buckets = {
+        int(x.get("case_id") or 0): _eval_case_bucket(case_map.get(int(x.get("case_id") or 0), {}))
+        for x in results
+    }
+    file_eval_results = [x for x in results if buckets.get(int(x.get("case_id") or 0)) == "file_eval"]
+    unresolved_results = [x for x in results if buckets.get(int(x.get("case_id") or 0)) == "unresolved_file_eval"]
+    labeled_results = file_eval_results + unresolved_results
+    non_file_eval_results = [x for x in results if buckets.get(int(x.get("case_id") or 0)) == "non_file_eval"]
+    params = (run or {}).get("params") or {}
+    retrieval_only = str(params.get("generation_mode") or "").strip().lower() in {"retrieval_only", "retrieval-only"}
 
     def _rate(field: str, items: list[dict[str, Any]] | None = None) -> str:
         pool = items if items is not None else results
@@ -2682,17 +3781,45 @@ def _finalize_eval_run_summary(run_id: int) -> list[list[Any]]:
             return "—"
         return f"{(sum(1 for v in vals if v) / len(vals)) * 100:.1f}%"
 
+    def _rate_all_labeled(field: str) -> str:
+        """可解析样本按原字段计；未解析期望文件计为未命中（暴露进分母）。"""
+        if not labeled_results:
+            return "—"
+        hits = 0
+        for item in labeled_results:
+            bucket = buckets.get(int(item.get("case_id") or 0))
+            if bucket == "unresolved_file_eval":
+                continue
+            if item.get(field) is True:
+                hits += 1
+        return f"{(hits / len(labeled_results)) * 100:.1f}%"
+
     summary = {
         "case_count": len(results),
         "file_eval_case_count": len(file_eval_results),
+        "unresolved_file_case_count": len(unresolved_results),
+        "labeled_file_case_count": len(labeled_results),
         "non_file_eval_case_count": len(non_file_eval_results),
         "candidate_hit_rate": _rate("candidate_hit", file_eval_results),
+        "candidate_hit_rate_all_labeled": _rate_all_labeled("candidate_hit"),
         "context_hit_rate": _rate("context_hit", file_eval_results),
+        "context_hit_rate_all_labeled": _rate_all_labeled("context_hit"),
         "chunk_hit_rate": _rate("chunk_hit", file_eval_results),
-        "answer_hit_rate": _rate("answer_hit", results),
-        "abstain_accuracy": _rate("abstain_correct", results),
+        "answer_hit_rate": "—" if retrieval_only else _rate("answer_hit", results),
+        "abstain_accuracy": "—" if retrieval_only else _rate("abstain_correct", results),
         "ok_count": sum(1 for x in results if str(x.get("error_type") or "") == "OK"),
+        "generation_mode": params.get("generation_mode"),
+        "query_anchoring_enabled": params.get("query_anchoring_enabled"),
+        "retrieval_degraded": bool(params.get("retrieval_degraded")),
+        "chunk_params_mismatch": bool(params.get("chunk_params_mismatch")),
     }
+    attr_counts: dict[str, int] = {}
+    for item in results:
+        code = attribution_code(diagnostics=item.get("diagnostics"), error_type=item.get("error_type"))
+        attr_counts[code] = attr_counts.get(code, 0) + 1
+    summary["attribution_counts"] = attr_counts
+    summary["run_fingerprint"] = params.get("run_fingerprint")
+    summary["dataset_quality"] = params.get("dataset_quality") or {}
     store.finish_eval_run(run_id, summary)
     return _summary_rows_from_summary(summary)
 
@@ -2710,256 +3837,6 @@ def _eval_run_id_from_select(evt: gr.SelectData) -> int | None:
     return None
 
 
-def do_run_eval_dataset(
-    dataset_choice: str | None,
-    run_name: str,
-    system_prompt: str,
-    top_n: int,
-    top_k: int,
-    use_rerank: bool,
-    chunk_size: int,
-    chunk_overlap: int,
-    chunk_mode: str,
-    llm_model: str,
-    llm_num_ctx: float,
-    embed_model: str,
-):
-    dataset_id = _parse_eval_dataset_id(dataset_choice)
-    if dataset_id is None:
-        return "请先选择评测集。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
-    eng = _lazy_engine()
-    cases = store.fetch_eval_cases(dataset_id)
-    if not cases:
-        return "当前评测集没有样本。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
-    em = (embed_model or "").strip() or None
-    lm = (llm_model or "").strip() or None
-    cm = (chunk_mode or "sentence").strip().lower()
-    try:
-        nctx = int(round(float(llm_num_ctx)))
-    except (TypeError, ValueError):
-        nctx = 16384
-    nctx = max(2048, min(nctx, 262144))
-    top_n = max(1, int(top_n))
-    top_k = max(1, min(int(top_k), top_n))
-
-    index = eng.get_index(cfg, embed_model=em)
-    if index is None:
-        return "当前没有可用索引，请先构建知识库索引。", [[0, "", "", "", "", "", "", "", "", ""]], [["样本数", 0]], _eval_run_summary_rows()
-
-    params = eng.build_params_snapshot(
-        cfg,
-        int(chunk_size),
-        int(chunk_overlap),
-        top_n,
-        top_k,
-        bool(use_rerank),
-        chunk_mode=cm,
-        llm_model=lm,
-        embed_model=em,
-        llm_num_ctx=nctx,
-    )
-    index_state = _build_index_status_snapshot()
-    index_block_msg = _index_state_blocking_message(index_state)
-    if index_block_msg:
-        return (
-            index_block_msg,
-            [[0, "", "", "", "", "", "", "", "", ""]],
-            [["样本数", 0]],
-            _eval_run_summary_rows(),
-        )
-    title = str(run_name or "").strip() or f"评测运行 {time.strftime('%Y-%m-%d %H:%M:%S')}"
-    run_id = store.create_eval_run(dataset_id, title, params)
-    log_lines = [f"已创建评测运行：RUN#{run_id}，共 {len(cases)} 题。"]
-    result_rows: list[list[Any]] = []
-
-    for idx, case in enumerate(cases, start=1):
-        qtext = str(case.get("question") or "").strip()
-        log_lines.append(f"[{idx}/{len(cases)}] {qtext}")
-        nodes_vec = eng.vector_retrieve(cfg, index, qtext, top_n)
-        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        nodes, kind = eng.apply_topk_rerank(cfg, qtext, nodes_vec, top_k, bool(use_rerank))
-        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
-            cfg,
-            qtext,
-            nodes,
-            llm_model=lm,
-            llm_num_ctx=nctx,
-        )
-        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
-        diag_payload = _retrieval_diag_payload(
-            query=qtext,
-            vector_candidates=vector_diag,
-            final_sources=sources,
-            top_n=top_n,
-            top_k=top_k,
-            use_rerank=bool(use_rerank),
-            score_kind=kind,
-        )
-        diag_payload["context_selected_count"] = len(nodes_for_answer)
-        diag_payload["context_truncated"] = bool(context_truncated)
-        diag_payload["index_state"] = dict(index_state)
-        diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
-        if not nodes_for_answer:
-            answer = (
-                "**根据已知材料无法回答。**\n\n"
-                "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
-            )
-        else:
-            parts: list[str] = []
-            for token in eng.stream_answer(
-                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
-            ):
-                parts.append(token)
-            answer = "".join(parts).strip() or "（模型未返回正文）"
-        judge = _evaluate_case_result(case, vector_diag, sources, answer)
-        diag_payload["eval_case_diagnostics"] = {
-            "issue_codes": list(judge.get("issue_codes") or []),
-            "expected_file_resolution": dict(judge.get("expected_file_resolution") or {}),
-            "matched_candidate_files": list(judge.get("matched_candidate_files") or []),
-            "filtered_out": bool(judge.get("filtered_out")),
-            "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
-            "candidate_hit": judge.get("candidate_hit"),
-            "context_hit": judge.get("context_hit"),
-            "chunk_hit": judge.get("chunk_hit"),
-            "answer_hit": judge.get("answer_hit"),
-            "abstain_expected": bool(judge.get("abstain_expected")),
-            "abstain_actual": bool(judge.get("abstain_actual")),
-            "abstain_correct": judge.get("abstain_correct"),
-            "error_type": str(judge.get("error_type") or ""),
-        }
-        qa_id = store.insert_qa(
-            question=qtext,
-            answer=answer,
-            sources=sources,
-            params=params,
-            diagnostics=diag_payload,
-            session_id=None,
-        )
-        store.save_eval_case_result(
-            run_id=run_id,
-            case_id=int(case["id"]),
-            question=qtext,
-            answer=answer,
-            sources=sources,
-            diagnostics=diag_payload,
-            candidate_hit=judge["candidate_hit"],
-            context_hit=judge["context_hit"],
-            chunk_hit=judge["chunk_hit"],
-            answer_hit=judge["answer_hit"],
-            abstain_expected=judge["abstain_expected"],
-            abstain_actual=judge["abstain_actual"],
-            abstain_correct=judge["abstain_correct"],
-            error_type=str(judge["error_type"] or ""),
-            qa_id=qa_id,
-        )
-        result_rows.append(
-            [
-                idx,
-                qtext,
-                "命中" if judge["candidate_hit"] else ("—" if judge["candidate_hit"] is None else "未命中"),
-                "命中" if judge["context_hit"] else ("—" if judge["context_hit"] is None else "未命中"),
-                "命中" if judge["chunk_hit"] else ("—" if judge["chunk_hit"] is None else "未命中"),
-                "命中" if judge["answer_hit"] else ("—" if judge["answer_hit"] is None else "未命中"),
-                "正确" if judge["abstain_correct"] else "错误",
-                str(judge["error_type"] or ""),
-                str(sources[0].get("file_name") or "—") if sources else "—",
-                qa_id,
-            ]
-        )
-        log_lines.append(
-            f"    候选 {len(nodes_vec)} 条，最终上下文 {len(nodes_for_answer)} 条，判定={judge['error_type']}，QA#{qa_id}"
-        )
-
-    if not result_rows:
-        result_rows = [[0, "（暂无结果）", "", "", "", "", "", "", "", ""]]
-    summary_rows = _finalize_eval_run_summary(run_id)
-    return "\n".join(log_lines), result_rows, summary_rows, _eval_run_summary_rows_for_dataset(dataset_id)
-
-
-def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
-    try:
-        cases = _parse_eval_cases_from_file(file_obj)
-    except Exception as e:
-        msg = f"导入失败：{type(e).__name__}: {e}"
-        if "openpyxl" in str(e).lower():
-            msg += "。当前环境缺少 Excel 依赖，请在项目 .venv 中重新安装 requirements.txt。"
-        choices, value = _eval_dataset_choices()
-        return (
-            msg,
-            gr.update(choices=choices, value=value),
-            [[0, "（暂无样本）", "", "", "", "", "", ""]],
-            "未导入评测集。",
-            _eval_run_summary_rows_for_dataset(None),
-            _empty_eval_result_rows(),
-            _empty_eval_summary_rows(),
-        )
-    if not cases:
-        choices, value = _eval_dataset_choices()
-        return (
-            "导入失败：文件里没有有效样本，至少需要 question 字段。",
-            gr.update(choices=choices, value=value),
-            [[0, "（暂无样本）", "", "", "", "", "", ""]],
-            "未导入评测集。",
-            _eval_run_summary_rows_for_dataset(None),
-            _empty_eval_result_rows(),
-            _empty_eval_summary_rows(),
-        )
-    name = str(dataset_name or "").strip()
-    if not name:
-        name = Path(getattr(file_obj, "name", file_obj)).stem
-    dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
-    choices, _ = _eval_dataset_choices()
-    choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
-    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
-    return (
-        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
-        gr.update(choices=choices, value=choice_value),
-        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
-        _eval_dataset_summary_markdown(dataset_id),
-        recent_rows,
-        result_rows,
-        summary_rows,
-    )
-
-
-def do_eval_dataset_select(dataset_choice: str | None):
-    dataset_id = _parse_eval_dataset_id(dataset_choice)
-    if dataset_id is None:
-        return (
-            "未选择评测集。",
-            [[0, "（暂无样本）", "", "", "", "", "", ""]],
-            _eval_run_summary_rows_for_dataset(None),
-            _empty_eval_result_rows(),
-            _empty_eval_summary_rows(),
-        )
-    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
-    return (
-        _eval_dataset_summary_markdown(dataset_id),
-        _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
-        recent_rows,
-        result_rows,
-        summary_rows,
-    )
-
-
-def do_eval_run_select(dataset_choice: str | None, evt: gr.SelectData):
-    dataset_id = _parse_eval_dataset_id(dataset_choice)
-    run_id = _eval_run_id_from_select(evt)
-    if run_id is None:
-        summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
-        return "未选中实验运行。", result_rows, summary_rows, recent_rows
-    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, run_id)
-    return f"已载入 RUN#{run_id} 的实验结果。", result_rows, summary_rows, recent_rows
-
-
-def do_eval_dashboard_refresh(dataset_choice: str | None):
-    dataset_id = _parse_eval_dataset_id(dataset_choice)
-    summary_rows, recent_rows, result_rows = _eval_run_dashboard_outputs(dataset_id, None)
-    if dataset_id is None:
-        return "未选择评测集。", recent_rows, result_rows, summary_rows
-    return f"已刷新评测集 #{dataset_id} 的实验面板。", recent_rows, result_rows, summary_rows
-
-
 def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
     try:
         cases = _parse_eval_cases_from_file(file_obj)
@@ -2979,6 +3856,13 @@ def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
+            _eval_dataset_quality_rows(None),
+            _eval_failure_detail_rows(None),
+            _eval_file_alias_rows(None),
+            _eval_alias_target_dropdown_update(),
         )
     if not cases:
         choices, value = _eval_dataset_choices()
@@ -2993,16 +3877,25 @@ def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
+            _eval_dataset_quality_rows(None),
+            _eval_failure_detail_rows(None),
+            _eval_file_alias_rows(None),
+            _eval_alias_target_dropdown_update(),
         )
     name = str(dataset_name or "").strip()
     if not name:
         name = Path(getattr(file_obj, "name", file_obj)).stem
     dataset_id = store.replace_eval_dataset(name, cases, description=str(description or "").strip() or None)
+    imported_dataset = store.get_eval_dataset(dataset_id) or {}
+    imported_name = str(imported_dataset.get("name") or name)
     choices, _ = _eval_dataset_choices()
     choice_value = next((x for x in choices if x.startswith(f"#{dataset_id} ")), None)
-    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = _eval_run_dashboard_outputs(dataset_id, None)
     return (
-        f"已导入评测集：#{dataset_id} {name}，共 {len(cases)} 题。",
+        f"已导入评测集：#{dataset_id} {imported_name}，共 {len(cases)} 题。",
         gr.update(choices=choices, value=choice_value),
         _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
         _eval_dataset_summary_markdown(dataset_id),
@@ -3012,6 +3905,13 @@ def do_eval_dataset_import(file_obj: Any, dataset_name: str, description: str):
         param_rows,
         error_rows,
         tag_rows,
+        file_rows,
+        chunk_diag_rows,
+        funnel_rows,
+        _eval_dataset_quality_rows(dataset_id),
+        _eval_failure_detail_rows(_latest_eval_run_id(dataset_id)),
+        _eval_file_alias_rows(dataset_id),
+        _eval_alias_target_dropdown_update(),
     )
 
 
@@ -3027,8 +3927,15 @@ def do_eval_dataset_select(dataset_choice: str | None):
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
+            _eval_dataset_quality_rows(None),
+            _eval_failure_detail_rows(None),
+            _eval_file_alias_rows(None),
+            _eval_alias_target_dropdown_update(),
         )
-    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = _eval_run_dashboard_outputs(dataset_id, None)
     return (
         _eval_dataset_summary_markdown(dataset_id),
         _eval_cases_preview_rows(store.fetch_eval_cases(dataset_id)),
@@ -3038,6 +3945,13 @@ def do_eval_dataset_select(dataset_choice: str | None):
         param_rows,
         error_rows,
         tag_rows,
+        file_rows,
+        chunk_diag_rows,
+        funnel_rows,
+        _eval_dataset_quality_rows(dataset_id),
+        _eval_failure_detail_rows(_latest_eval_run_id(dataset_id)),
+        _eval_file_alias_rows(dataset_id),
+        _eval_alias_target_dropdown_update(),
     )
 
 
@@ -3045,18 +3959,102 @@ def do_eval_run_select(dataset_choice: str | None, evt: gr.SelectData):
     dataset_id = _parse_eval_dataset_id(dataset_choice)
     run_id = _eval_run_id_from_select(evt)
     if run_id is None:
-        summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
-        return "未选中实验运行。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
-    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, run_id)
-    return f"已载入 RUN#{run_id} 的实验结果。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
+        summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = _eval_run_dashboard_outputs(dataset_id, None)
+        return "未选中实验运行。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = _eval_run_dashboard_outputs(dataset_id, run_id)
+    return f"已载入 RUN#{run_id} 的实验结果。", result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
 
 
 def do_eval_dashboard_refresh(dataset_choice: str | None):
     dataset_id = _parse_eval_dataset_id(dataset_choice)
-    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows = _eval_run_dashboard_outputs(dataset_id, None)
+    summary_rows, recent_rows, result_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows = _eval_run_dashboard_outputs(dataset_id, None)
     if dataset_id is None:
-        return "未选择评测集。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows
-    return f"已刷新评测集 #{dataset_id} 的实验面板。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows
+        return "未选择评测集。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
+    return f"已刷新评测集 #{dataset_id} 的实验面板。", recent_rows, result_rows, summary_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
+
+
+def do_eval_governance_refresh(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    return (
+        _eval_dataset_quality_rows(dataset_id),
+        _eval_failure_detail_rows(_latest_eval_run_id(dataset_id)),
+        _eval_file_alias_rows(dataset_id),
+        _eval_alias_target_dropdown_update(),
+    )
+
+
+def _summary_rows_to_map(rows: list[list[Any]]) -> dict[str, Any]:
+    return {str(r[0]): r[1] for r in rows or [] if isinstance(r, (list, tuple)) and len(r) >= 2}
+
+
+def do_run_retrieval_param_grid(dataset_choice: str | None):
+    dataset_id = _parse_eval_dataset_id(dataset_choice)
+    if dataset_id is None:
+        return "请先选择评测集。", [["（暂无网格结果）", "", "", "", "", "", "", "", ""]], _eval_run_summary_rows_for_dataset(None), _eval_run_compare_rows(), _eval_run_diff_rows(), _eval_baseline_compare_rows(None)
+    specs = [
+        {"mode": "keyword", "top_n": 5, "top_k": 1, "rerank": False},
+        {"mode": "keyword", "top_n": 8, "top_k": 3, "rerank": False},
+        {"mode": "vector", "top_n": 5, "top_k": 2, "rerank": False},
+        {"mode": "hybrid", "top_n": 5, "top_k": 2, "rerank": False},
+        {"mode": "hybrid", "top_n": 8, "top_k": 3, "rerank": False},
+        {"mode": "hybrid", "top_n": 8, "top_k": 3, "rerank": True},
+    ]
+    rows: list[list[Any]] = []
+    logs: list[str] = [f"开始 retrieval-only 参数网格，共 {len(specs)} 组。"]
+    for spec in specs:
+        mode = str(spec["mode"])
+        tn = int(spec["top_n"])
+        tk = int(spec["top_k"])
+        rr = bool(spec["rerank"])
+        # 参数网格只变检索 knobs；切片取自索引；anchoring 关闭（真实召回）
+        out = do_run_eval_dataset(
+            dataset_choice,
+            f"grid retrieval {mode} topN={tn} topK={tk} rerank={rr} {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            str(cfg.prompt.get("system_default", "")).strip(),
+            tn,
+            tk,
+            rr,
+            None,
+            None,
+            None,
+            str(cfg.ollama.get("llm_model") or ""),
+            2048,
+            str(cfg.ollama.get("embed_model") or ""),
+            "retrieval_only",
+            mode,
+            False,
+        )
+        try:
+            status, _result_rows, summary_rows, _recent_rows, _param_rows, _error_rows, _tag_rows, _file_rows, _chunk_rows, _funnel_rows = out
+            summary = _summary_rows_to_map(summary_rows)
+            run = _latest_eval_run(dataset_id)
+            rows.append([
+                int((run or {}).get("id") or 0),
+                mode,
+                "yes" if rr else "no",
+                tn,
+                tk,
+                summary.get("Candidate hit rate") or "-",
+                summary.get("Context hit rate") or "-",
+                summary.get("Chunk hit rate") or "-",
+                summary.get("Candidate hit rate (all labeled)") or "-",
+            ])
+            logs.append(str(status).splitlines()[0] if str(status).strip() else f"topN={tn}, topK={tk} done")
+        except Exception as exc:
+            rows.append([0, mode, "yes" if rr else "no", tn, tk, "-", "-", "-", f"ERROR: {type(exc).__name__}: {exc}"])
+            logs.append(f"topN={tn}, topK={tk} 失败：{type(exc).__name__}: {exc}")
+    if not rows:
+        rows = [["（暂无网格结果）", "", "", "", "", "", "", "", ""]]
+    if rows and str(rows[0][0]).isdigit():
+        rows.sort(
+            key=lambda r: (
+                _pct_text_to_float(r[6]) or -1.0,
+                _pct_text_to_float(r[7]) or -1.0,
+                _pct_text_to_float(r[5]) or -1.0,
+            ),
+            reverse=True,
+        )
+    return "\n".join(logs), rows, _eval_run_summary_rows_for_dataset(dataset_id), _eval_run_compare_rows(), _eval_run_diff_rows(), _eval_baseline_compare_rows(dataset_id)
 
 
 def do_run_eval_dataset(
@@ -3066,12 +4064,15 @@ def do_run_eval_dataset(
     top_n: int,
     top_k: int,
     use_rerank: bool,
-    chunk_size: int,
-    chunk_overlap: int,
-    chunk_mode: str,
+    chunk_size: int | None,
+    chunk_overlap: int | None,
+    chunk_mode: str | None,
     llm_model: str,
     llm_num_ctx: float,
     embed_model: str,
+    generation_mode: str = "llm",
+    retrieval_mode: str = "hybrid",
+    query_anchoring: bool = False,
 ):
     dataset_id = _parse_eval_dataset_id(dataset_choice)
     if dataset_id is None:
@@ -3083,6 +4084,9 @@ def do_run_eval_dataset(
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
         )
     eng = _lazy_engine()
     cases = store.fetch_eval_cases(dataset_id)
@@ -3095,17 +4099,33 @@ def do_run_eval_dataset(
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
         )
     em = (embed_model or "").strip() or None
-    lm = (llm_model or "").strip() or None
-    cm = (chunk_mode or "sentence").strip().lower()
+    generation_mode = normalize_generation_mode(generation_mode, llm_model)
+    retrieval_only = generation_mode == "retrieval_only"
+    lm = effective_llm_model(llm_model, generation_mode)
+    retrieval_mode = normalize_retrieval_mode(retrieval_mode)
+    vector_enabled, keyword_enabled = retrieval_flags(retrieval_mode)
+    cm = (str(chunk_mode).strip().lower() if chunk_mode else None)
+    query_anchoring_enabled = bool(query_anchoring)
     try:
         nctx = int(round(float(llm_num_ctx)))
     except (TypeError, ValueError):
         nctx = 16384
     nctx = max(2048, min(nctx, 262144))
     top_n = max(1, int(top_n))
-    top_k = max(1, min(int(top_k), top_n))
+    top_k = max(1, int(top_k))
+    try:
+        chunk_size_i = int(chunk_size) if chunk_size is not None else None
+    except (TypeError, ValueError):
+        chunk_size_i = None
+    try:
+        chunk_overlap_i = int(chunk_overlap) if chunk_overlap is not None else None
+    except (TypeError, ValueError):
+        chunk_overlap_i = None
 
     index = eng.get_index(cfg, embed_model=em)
     if index is None:
@@ -3117,6 +4137,9 @@ def do_run_eval_dataset(
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
         )
     exclusion_info = build_excluded_file_set(cfg, index=index, prefer_index=True)
     excluded_files = list(exclusion_info.get("excluded_files") or [])
@@ -3125,8 +4148,8 @@ def do_run_eval_dataset(
 
     params = eng.build_params_snapshot(
         cfg,
-        int(chunk_size),
-        int(chunk_overlap),
+        chunk_size_i,
+        chunk_overlap_i,
         top_n,
         top_k,
         bool(use_rerank),
@@ -3137,9 +4160,14 @@ def do_run_eval_dataset(
         excluded_files=excluded_files,
         excluded_doc_classes=excluded_doc_classes,
         include_zero_chunk=include_zero_chunk,
-        query_anchoring_enabled=True,
-        query_anchoring_source="expected_file_names",
+        query_anchoring_enabled=query_anchoring_enabled,
+        query_anchoring_source="expected_file_names" if query_anchoring_enabled else None,
+        vector_enabled=vector_enabled,
+        keyword_enabled=keyword_enabled,
+        generation_mode=generation_mode,
+        prefer_index_chunk_params=True,
     )
+    params["dataset_quality"] = dataset_quality_summary(cases, resolve_expected_file_details=_resolve_expected_eval_file_details)
     index_state = _build_index_status_snapshot()
     index_block_msg = _index_state_blocking_message(index_state)
     if index_block_msg:
@@ -3151,137 +4179,246 @@ def do_run_eval_dataset(
             _empty_eval_param_rows(),
             _empty_eval_error_rows(),
             _empty_eval_tag_rows(),
+            _empty_eval_file_rows(),
+            _empty_eval_chunk_diag_rows(),
+            _empty_eval_funnel_rows(),
         )
-    retrieval_only = str(lm or "").strip().lower() in {"[retrieval-only]", "retrieval-only", "retrieval_only"}
     title = str(run_name or "").strip() or f"评测运行 {time.strftime('%Y-%m-%d %H:%M:%S')}"
     run_id = store.create_eval_run(dataset_id, title, params)
+    run_error = ""
+    run_vector_degraded = False
     log_lines = [f"已创建评测运行：RUN#{run_id}，共 {len(cases)} 题。"]
     log_lines.append(
         f"当前排除文件 {len(excluded_files)} 个，分类={('/'.join(excluded_doc_classes) or '—')}，含 zero-chunk={'是' if include_zero_chunk else '否'}。"
     )
-    log_lines.append("当前启用 query anchoring：基于 expected_file_names 增强评测检索问题。")
+    if params.get("chunk_params_warning"):
+        log_lines.append(str(params["chunk_params_warning"]))
+    else:
+        log_lines.append(
+            f"切片参数以索引为准：{params.get('chunk_mode')}/{params.get('chunk_size')}/{params.get('chunk_overlap')}。"
+        )
+    if query_anchoring_enabled:
+        log_lines.append("Query anchoring=ON：基于 expected_file_names 增强检索问题（非真实召回口径，勿作 baseline）。")
+    else:
+        log_lines.append("Query anchoring=OFF：使用原始问题检索（真实召回口径）。")
+    log_lines.append(f"Generation mode={generation_mode}; retrieval mode={retrieval_mode}.")
     if retrieval_only:
-        log_lines.append("当前运行为 retrieval-only：跳过 LLM 生成，只统计检索与上下文命中。")
+        log_lines.append("当前运行为 retrieval-only：跳过 LLM；answer/abstain 指标不计分。")
     result_rows: list[list[Any]] = []
 
-    for idx, case in enumerate(cases, start=1):
-        qtext = str(case.get("question") or "").strip()
-        retrieval_query, query_anchors = eng.build_anchored_eval_query(qtext, case.get("expected_file_names") or [])
-        log_lines.append(f"[{idx}/{len(cases)}] {qtext}")
-        nodes_vec = eng.vector_retrieve(cfg, index, retrieval_query, top_n)
-        vector_diag = eng.nodes_to_source_dicts(nodes_vec, "vector")
-        nodes_vec_filtered, excluded_candidate_count = eng.filter_nodes_by_excluded_files(nodes_vec, excluded_files)
-        nodes, kind = eng.apply_topk_rerank(cfg, retrieval_query, nodes_vec_filtered, top_k, bool(use_rerank))
-        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
-            cfg,
-            qtext,
-            nodes,
-            llm_model=lm,
-            llm_num_ctx=nctx,
-        )
-        sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
-        diag_payload = _retrieval_diag_payload(
-            query=retrieval_query,
-            raw_query=qtext,
-            query_anchors=query_anchors,
-            vector_candidates=vector_diag,
-            final_sources=sources,
-            top_n=top_n,
-            top_k=top_k,
-            use_rerank=bool(use_rerank),
-            score_kind=kind,
-            excluded_files=excluded_files,
-            excluded_doc_classes=excluded_doc_classes,
-            include_zero_chunk=include_zero_chunk,
-            excluded_candidate_count=excluded_candidate_count,
-        )
-        diag_payload["context_selected_count"] = len(nodes_for_answer)
-        diag_payload["context_truncated"] = bool(context_truncated)
-        diag_payload["index_state"] = dict(index_state)
-        diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
-        if not nodes_for_answer:
-            answer = (
-                "**根据已知材料无法回答。**\n\n"
-                "本轮未检索到任何文档片段，因此没有把上下文发给大模型。"
+    try:
+        for idx, case in enumerate(cases, start=1):
+            qtext = str(case.get("question") or "").strip()
+            if query_anchoring_enabled:
+                retrieval_query, query_anchors = eng.build_anchored_eval_query(
+                    qtext, case.get("expected_file_names") or []
+                )
+            else:
+                retrieval_query, query_anchors = qtext, []
+            log_lines.append(f"[{idx}/{len(cases)}] {qtext}")
+            retrieval_result = eng.hybrid_retrieve(
+                cfg,
+                index,
+                retrieval_query,
+                top_n,
+                top_k,
+                bool(use_rerank),
+                excluded_files,
+                vector_enabled=vector_enabled,
+                keyword_enabled=keyword_enabled,
             )
-        elif retrieval_only:
-            answer = "[retrieval-only]"
-        else:
-            parts: list[str] = []
-            for token in eng.stream_answer(
-                cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
-            ):
-                parts.append(token)
-            answer = "".join(parts).strip() or "（模型未返回正文）"
-        judge = _evaluate_case_result(case, vector_diag, sources, answer)
-        diag_payload["eval_case_diagnostics"] = {
-            "issue_codes": list(judge.get("issue_codes") or []),
-            "expected_file_resolution": dict(judge.get("expected_file_resolution") or {}),
-            "matched_candidate_files": list(judge.get("matched_candidate_files") or []),
-            "filtered_out": bool(judge.get("filtered_out")),
-            "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
-            "candidate_hit": judge.get("candidate_hit"),
-            "context_hit": judge.get("context_hit"),
-            "chunk_hit": judge.get("chunk_hit"),
-            "answer_hit": judge.get("answer_hit"),
-            "abstain_expected": bool(judge.get("abstain_expected")),
-            "abstain_actual": bool(judge.get("abstain_actual")),
-            "abstain_correct": judge.get("abstain_correct"),
-            "error_type": str(judge.get("error_type") or ""),
-        }
-        qa_id = store.insert_qa(
-            question=qtext,
-            answer=answer,
-            sources=sources,
-            params=params,
-            diagnostics=diag_payload,
-            session_id=None,
-        )
-        store.save_eval_case_result(
-            run_id=run_id,
-            case_id=int(case["id"]),
-            question=qtext,
-            answer=answer,
-            sources=sources,
-            diagnostics=diag_payload,
-            candidate_hit=judge["candidate_hit"],
-            context_hit=judge["context_hit"],
-            chunk_hit=judge["chunk_hit"],
-            answer_hit=judge["answer_hit"],
-            abstain_expected=judge["abstain_expected"],
-            abstain_actual=judge["abstain_actual"],
-            abstain_correct=judge["abstain_correct"],
-            error_type=str(judge["error_type"] or ""),
-            qa_id=qa_id,
-        )
-        result_rows.append(
-            [
-                idx,
+            if retrieval_result.retrieval_degraded:
+                run_vector_degraded = True
+            vector_diag = eng.nodes_to_source_dicts(retrieval_result.vector_nodes, "vector")
+            keyword_diag = eng.nodes_to_source_dicts(retrieval_result.keyword_nodes, "keyword")
+            merged_diag = eng.nodes_to_source_dicts(retrieval_result.merged_nodes, "hybrid")
+            excluded_candidate_count = retrieval_result.excluded_candidate_count
+            nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
+            final_ranked_sources = eng.nodes_to_source_dicts(nodes, kind)
+            nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+                cfg,
                 qtext,
-                "命中" if judge["candidate_hit"] else ("—" if judge["candidate_hit"] is None else "未命中"),
-                "命中" if judge["context_hit"] else ("—" if judge["context_hit"] is None else "未命中"),
-                "命中" if judge["chunk_hit"] else ("—" if judge["chunk_hit"] is None else "未命中"),
-                "命中" if judge["answer_hit"] else ("—" if judge["answer_hit"] is None else "未命中"),
-                "正确" if judge["abstain_correct"] else "错误",
-                str(judge["error_type"] or ""),
-                str(sources[0].get("file_name") or "—") if sources else "—",
-                qa_id,
-            ]
-        )
-        log_lines.append(
-            f"    候选 {len(nodes_vec)} 条，过滤后 {len(nodes_vec_filtered)} 条，排除 {excluded_candidate_count} 条，最终上下文 {len(nodes)} 条，判定={judge['error_type']}，QA#{qa_id}"
-        )
+                nodes,
+                llm_model=lm,
+                llm_num_ctx=nctx,
+            )
+            sources = eng.nodes_to_source_dicts(nodes_for_answer, kind)
+            no_context = not bool(nodes_for_answer)
+            diag_payload = _retrieval_diag_payload(
+                query=retrieval_query,
+                raw_query=qtext,
+                query_anchors=query_anchors,
+                vector_candidates=vector_diag,
+                keyword_candidates=keyword_diag,
+                merged_candidates=merged_diag,
+                final_sources=sources,
+                top_n=top_n,
+                top_k=top_k,
+                use_rerank=bool(use_rerank),
+                score_kind=kind,
+                excluded_files=excluded_files,
+                excluded_doc_classes=excluded_doc_classes,
+                include_zero_chunk=include_zero_chunk,
+                excluded_candidate_count=excluded_candidate_count,
+                retrieval_mode=retrieval_mode,
+            )
+            diag_payload["final_ranked_contexts"] = final_ranked_sources
+            diag_payload["context_selected_count"] = len(nodes_for_answer)
+            diag_payload["context_truncated"] = bool(context_truncated)
+            diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
+            diag_payload["retrieval_degraded"] = bool(retrieval_result.retrieval_degraded)
+            diag_payload["requested_retrieval_mode"] = str(
+                getattr(retrieval_result, "requested_retrieval_mode", retrieval_mode) or retrieval_mode
+            )
+            diag_payload["query_anchoring_enabled"] = query_anchoring_enabled
+            diag_payload["no_context"] = no_context
+            diag_payload["index_state"] = dict(index_state)
+            diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
+            if no_context:
+                # 哨兵答案：不计为模型拒答，避免空检索被标成 OVER_ABSTAIN
+                answer = eval_judge.ANSWER_NO_CONTEXT
+            elif retrieval_only:
+                answer = eval_judge.ANSWER_RETRIEVAL_ONLY
+            else:
+                parts: list[str] = []
+                for token in eng.stream_answer(
+                    cfg, qtext, system_prompt, nodes_for_answer, llm_model=lm, llm_num_ctx=nctx
+                ):
+                    parts.append(token)
+                answer = "".join(parts).strip() or "（模型未返回正文）"
+            judge = _evaluate_case_result(
+                case,
+                merged_diag,
+                sources,
+                answer,
+                final_ranked_sources=final_ranked_sources,
+                use_rerank=bool(use_rerank),
+                context_truncated=bool(context_truncated),
+                generation_mode=generation_mode,
+                no_context=no_context,
+            )
+            diag_payload["eval_case_diagnostics"] = {
+                "issue_codes": list(judge.get("issue_codes") or []),
+                "expected_file_resolution": dict(judge.get("expected_file_resolution") or {}),
+                "matched_candidate_files": list(judge.get("matched_candidate_files") or []),
+                "chunk_diagnostics": dict(judge.get("chunk_diagnostics") or {}),
+                "filtered_out": bool(judge.get("filtered_out")),
+                "final_ranked_hit": judge.get("final_ranked_hit"),
+                "topk_or_rerank_drop": bool(judge.get("topk_or_rerank_drop")),
+                "context_budget_drop": bool(judge.get("context_budget_drop")),
+                "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
+                "candidate_hit": judge.get("candidate_hit"),
+                "context_hit": judge.get("context_hit"),
+                "chunk_hit": judge.get("chunk_hit"),
+                "answer_hit": judge.get("answer_hit"),
+                "abstain_expected": bool(judge.get("abstain_expected")),
+                "abstain_actual": bool(judge.get("abstain_actual")),
+                "abstain_correct": judge.get("abstain_correct"),
+                "abstain_with_target_context": bool(judge.get("abstain_with_target_context")),
+                "error_type": str(judge.get("error_type") or ""),
+                "retrieval_only": bool(judge.get("retrieval_only")),
+                "no_context": bool(judge.get("no_context")),
+            }
+            diag_payload["retrieval_attribution"] = attribution_code(
+                diagnostics=diag_payload,
+                judge=judge,
+                error_type=str(judge.get("error_type") or ""),
+            )
+            qa_id = store.insert_qa(
+                question=qtext,
+                answer=answer,
+                sources=sources,
+                params=params,
+                diagnostics=diag_payload,
+                session_id=None,
+            )
+            store.save_eval_case_result(
+                run_id=run_id,
+                case_id=int(case["id"]),
+                question=qtext,
+                answer=answer,
+                sources=sources,
+                diagnostics=diag_payload,
+                candidate_hit=judge["candidate_hit"],
+                context_hit=judge["context_hit"],
+                chunk_hit=judge["chunk_hit"],
+                answer_hit=judge["answer_hit"],
+                abstain_expected=judge["abstain_expected"],
+                abstain_actual=judge["abstain_actual"],
+                abstain_correct=judge["abstain_correct"],
+                error_type=str(judge["error_type"] or ""),
+                qa_id=qa_id,
+            )
+            attribution = str(diag_payload.get("retrieval_attribution") or "")
+            abstain_cell = (
+                "—"
+                if judge.get("abstain_correct") is None
+                else ("正确" if judge["abstain_correct"] else "错误")
+            )
+            result_rows.append(
+                [
+                    idx,
+                    qtext,
+                    "命中" if judge["candidate_hit"] else ("—" if judge["candidate_hit"] is None else "未命中"),
+                    "命中" if judge["context_hit"] else ("—" if judge["context_hit"] is None else "未命中"),
+                    "命中" if judge["chunk_hit"] else ("—" if judge["chunk_hit"] is None else "未命中"),
+                    "命中" if judge["answer_hit"] else ("—" if judge["answer_hit"] is None else "未命中"),
+                    abstain_cell,
+                    str(judge["error_type"] or ""),
+                    attribution,
+                    str(sources[0].get("file_name") or "—") if sources else "—",
+                    qa_id,
+                ]
+            )
+            degrade_note = f", degraded={kind}" if retrieval_result.retrieval_degraded else ""
+            log_lines.append(
+                f"    candidates {len(retrieval_result.merged_nodes)} "
+                f"(vector {len(retrieval_result.vector_nodes)} / keyword {len(retrieval_result.keyword_nodes)}), "
+                f"excluded {excluded_candidate_count}, context {len(nodes_for_answer)}, "
+                f"verdict={judge['error_type']}{degrade_note}, QA#{qa_id}"
+            )
+    except Exception:
+        run_error = traceback.format_exc()
+        log_lines.append("评测运行异常中断，已保存已完成样本并写入当前汇总。")
+        log_lines.append(run_error)
+
+    if run_vector_degraded:
+        try:
+            params = store.patch_eval_run_params(
+                run_id,
+                {
+                    "retrieval_degraded": True,
+                    "vector_error": "one_or_more_cases_vector_stage_failed",
+                },
+            )
+            log_lines.append("警告：向量检索曾失败，本 RUN 已标记 retrieval_degraded（score_kind=keyword_fallback/vector_error）。")
+        except Exception:
+            params["retrieval_degraded"] = True
+            log_lines.append("警告：向量检索曾失败，但回写 RUN 参数失败；汇总仍会尽量标记降级。")
 
     if not result_rows:
         result_rows = _empty_eval_result_rows()
     summary_rows = _finalize_eval_run_summary(run_id)
+    if run_error:
+        summary_rows.append(["运行状态", "异常中断（部分结果已保存）"])
+    try:
+        compare_path = write_eval_case_compare(store, run_id, cfg.data_dir / "exports")
+        log_lines.append(f"已导出逐题对比表（原题+评测结果）：{compare_path}")
+        summary_rows.append(["逐题对比表", str(compare_path)])
+    except Exception as export_exc:
+        log_lines.append(f"逐题对比表导出失败：{type(export_exc).__name__}: {export_exc}")
     recent_rows = _eval_run_summary_rows_for_dataset(dataset_id)
     run_rows = store.list_eval_runs(limit=200)
     run = next((r for r in run_rows if int(r.get("id") or 0) == int(run_id)), None)
     param_rows = _params_rows_from_run(run)
+    if run_error:
+        param_rows.append(["run_error", run_error])
     error_rows = _eval_error_rows_for_run(run_id)
     tag_rows = _eval_tag_rows_for_run(run)
-    return "\n".join(log_lines), result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows
+    file_rows = _eval_file_rows_for_run(run)
+    chunk_diag_rows = _eval_chunk_diag_rows_for_run(run_id)
+    funnel_rows = _eval_funnel_rows_for_run(run_id)
+    return "\n".join(log_lines), result_rows, summary_rows, recent_rows, param_rows, error_rows, tag_rows, file_rows, chunk_diag_rows, funnel_rows
 
 
 def build_ui():
@@ -4023,6 +5160,9 @@ def build_ui():
             gr.update(value=lang_cur),
             gr.update(choices=vis_c, value=vm_cur),
             gr.update(value=float(skip_cur)),
+            gr.update(value=kb_chroma_dir_redirect_warning_markdown(),
+                       visible=bool(kb_chroma_dir_redirect_warning_markdown())),
+            gr.update(visible=bool(kb_chroma_dir_redirect_warning_markdown())),
         )
 
     def _on_session_table_select(evt: gr.SelectData):
@@ -4218,13 +5358,28 @@ def build_ui():
                             visible=bool(_kb_warn0),
                             elem_classes=["rag-tip-block", "rag-tip-block--tight"],
                         )
+                        with gr.Row(elem_classes=["rag-tip-block", "rag-tip-block--tight"]):
+                            kb_chroma_redirect_warn = gr.Markdown(
+                                value=kb_chroma_dir_redirect_warning_markdown(),
+                                visible=bool(kb_chroma_dir_redirect_warning_markdown()),
+                            )
+                            kb_chroma_redirect_ack_btn = gr.Button(
+                                "✓ 不再提示",
+                                size="sm",
+                                variant="secondary",
+                                visible=bool(kb_chroma_dir_redirect_warning_markdown()),
+                            )
+                        kb_chroma_redirect_ack_btn.click(
+                            do_ack_chroma_dir_redirect,
+                            outputs=[kb_chroma_redirect_warn, kb_chroma_redirect_ack_btn],
+                        )
                         chunk_mode = gr.Radio(
                             choices=[
-                                ("按句切分（LlamaIndex Sentence，默认）", "sentence"),
+                                ("按句切分（LlamaIndex Sentence）", "sentence"),
                                 ("按 Token 切分", "token"),
                                 ("段落优先（双换行再切）", "paragraph"),
                             ],
-                            value="paragraph",
+                            value=str(c.get("chunk_mode_default") or "sentence").strip().lower() or "sentence",
                             label="切分策略",
                         )
                         chunk_size = gr.Slider(
@@ -4259,6 +5414,23 @@ def build_ui():
                                 wrap=False,
                                 max_height=220,
                             )
+                            gr.Markdown("##### Index Version Ops")
+                            with gr.Row():
+                                btn_index_ops = gr.Button("Refresh index diagnostics", variant="secondary", size="sm")
+                                btn_index_cleanup_preview = gr.Button("Preview old-index cleanup", variant="secondary", size="sm")
+                            index_ops_status = gr.Textbox(label="Cleanup preview", lines=2, max_lines=4)
+                            index_ops_summary = gr.HTML(value=index_ops_summary_html(index_ops_diagnostics(cfg, store=store, keep_recent=3)))
+                            index_ops_df = gr.Dataframe(
+                                headers=["Directory", "Path", "Size"],
+                                value=index_ops_rows(index_ops_diagnostics(cfg, store=store, keep_recent=3)),
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2],
+                                col_count=(3, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=180,
+                            )
 
                 kb_files_df.select(_on_kb_file_select, outputs=kb_file_sel)
                 btn_preview_chunks.click(
@@ -4270,6 +5442,26 @@ def build_ui():
                     do_chunk_diagnostics,
                     inputs=[embed_dd],
                     outputs=[chunk_diag_summary, chunk_diag_df],
+                )
+                btn_index_ops.click(
+                    do_index_ops_diagnostics,
+                    outputs=[index_ops_summary, index_ops_df],
+                )
+                btn_index_cleanup_preview.click(
+                    do_index_cleanup_dry_run,
+                    outputs=[index_ops_status, index_ops_summary, index_ops_df],
+                )
+
+                with gr.Row():
+                    btn_index_cleanup_apply = gr.Button("\u771f\u6b63\u6267\u884c\u6e05\u7406\uff08\u4e0d\u53ef\u6062\u590d\uff09", variant="stop", size="sm")
+                    cb_index_cleanup_confirm = gr.Checkbox(
+                        label="\u6211\u5df2\u786e\u8ba4\u8981\u6e05\u7406\u4ee5\u4e0a\u76ee\u5f55\uff08\u4e0d\u53ef\u6062\u590d\uff09",
+                        value=False,
+                    )
+                btn_index_cleanup_apply.click(
+                    do_index_cleanup_apply,
+                    [cb_index_cleanup_confirm],
+                    [index_ops_status, index_ops_summary, index_ops_df],
                 )
 
                 btn_save.click(
@@ -4354,7 +5546,7 @@ def build_ui():
                         chatbot = gr.Chatbot(
                             label="当前会话",
                             height=RAG_CHATBOT_HEIGHT_PX,
-                            type="tuples",
+                            type="messages",
                             show_copy_button=True,
                             elem_classes=["rag-chatbot-panel"],
                             placeholder=(
@@ -4541,6 +5733,21 @@ def build_ui():
                             precision=0,
                         )
                         with gr.Row():
+                            eval_generation_mode = gr.Radio(
+                                choices=[("Full LLM", "llm"), ("Retrieval-only", "retrieval_only")],
+                                value="llm",
+                                label="Generation mode",
+                            )
+                            eval_retrieval_mode = gr.Radio(
+                                choices=[("Hybrid", "hybrid"), ("Vector", "vector"), ("Keyword", "keyword")],
+                                value="hybrid",
+                                label="Retrieval mode",
+                            )
+                        eval_query_anchoring = gr.Checkbox(
+                            value=False,
+                            label="Query anchoring（把 expected 文件名拼进检索问题；默认关闭，真实召回请保持关闭）",
+                        )
+                        with gr.Row():
                             eval_top_n = gr.Slider(
                                 1,
                                 100,
@@ -4576,8 +5783,8 @@ def build_ui():
                                 ("按 Token 切分", "token"),
                                 ("段落优先", "paragraph"),
                             ],
-                            value="paragraph",
-                            label="切分策略",
+                            value=str(c.get("chunk_mode_default") or "sentence").strip().lower() or "sentence",
+                            label="切分策略（仅对照；RUN 指纹以当前索引 manifest 为准，改切片需重建）",
                         )
                         eval_use_rerank = gr.Checkbox(
                             value=bool(cfg.rerank.get("enabled_default", False)),
@@ -4631,12 +5838,12 @@ def build_ui():
                                 )
                             with gr.Tab("结果明细"):
                                 eval_run_result_df = gr.Dataframe(
-                                    headers=["#", "问题", "候选命中", "文档命中", "片段命中", "答案命中（参考）", "拒答判定（参考）", "错误类型", "首个来源", "QA ID"],
-                                    value=[[0, "（暂无结果）", "", "", "", "", "", "", "", ""]],
+                                    headers=["#", "问题", "候选命中", "文档命中", "片段命中", "答案命中（参考）", "拒答判定（参考）", "错误类型", "归因", "首个来源", "QA ID"],
+                                    value=_empty_eval_result_rows(),
                                     show_label=False,
                                     interactive=False,
-                                    static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-                                    col_count=(10, "fixed"),
+                                    static_columns=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                                    col_count=(11, "fixed"),
                                     type="array",
                                     wrap=False,
                                     max_height=520,
@@ -4665,8 +5872,94 @@ def build_ui():
                                             col_count=(6, "fixed"),
                                             type="array",
                                             wrap=False,
-                                            max_height=320,
+                                            max_height=220,
                                         )
+                                        eval_file_df = gr.Dataframe(
+                                            headers=["File", "Cases", "Candidate hit", "Context hit", "Chunk hit", "Answer hit", "OK", "Errors"],
+                                            value=_empty_eval_file_rows(),
+                                            show_label=False,
+                                            interactive=False,
+                                            static_columns=[0, 1, 2, 3, 4, 5, 6, 7],
+                                            col_count=(8, "fixed"),
+                                            type="array",
+                                            wrap=False,
+                                            max_height=260,
+                                        )
+                                eval_chunk_diag_df = gr.Dataframe(
+                                    headers=["Case ID", "错误类型", "片段命中", "最佳阶段", "Rank", "文件", "相似度", "覆盖率", "公共字符", "片段预览"],
+                                    value=_empty_eval_chunk_diag_rows(),
+                                    show_label=False,
+                                    interactive=False,
+                                    static_columns=list(range(10)),
+                                    col_count=(10, "fixed"),
+                                    type="array",
+                                    wrap=False,
+                                    max_height=260,
+                                )
+                                eval_funnel_df = gr.Dataframe(
+                                    headers=["Case ID", "阶段", "候选数", "目标文件命中", "未解析文件", "Top files", "错误类型", "QA ID"],
+                                    value=_empty_eval_funnel_rows(),
+                                    show_label=False,
+                                    interactive=False,
+                                    static_columns=list(range(8)),
+                                    col_count=(8, "fixed"),
+                                    type="array",
+                                    wrap=False,
+                                    max_height=300,
+                                )
+                                btn_eval_governance = gr.Button("刷新治理/失败详情", variant="secondary", size="sm")
+                                with gr.Row(equal_height=False):
+                                    eval_quality_df = gr.Dataframe(
+                                        headers=["质量项", "数量", "占比"],
+                                        value=_eval_dataset_quality_rows(_parse_eval_dataset_id(eval_value)),
+                                        show_label=False,
+                                        interactive=False,
+                                        static_columns=[0, 1, 2],
+                                        col_count=(3, "fixed"),
+                                        type="array",
+                                        wrap=False,
+                                        max_height=260,
+                                    )
+                                    eval_failure_df = gr.Dataframe(
+                                        headers=["Case ID", "问题", "错误类型", "归因", "未解析文件", "建议文件", "首个来源", "QA ID"],
+                                        value=_eval_failure_detail_rows(_latest_eval_run_id(_parse_eval_dataset_id(eval_value))),
+                                        show_label=False,
+                                        interactive=False,
+                                        static_columns=[0, 1, 2, 3, 4, 5, 6, 7],
+                                        col_count=(8, "fixed"),
+                                        type="array",
+                                        wrap=False,
+                                        max_height=320,
+                                    )
+                                with gr.Accordion("Expected file alias 治理", open=True):
+                                    eval_alias_status = gr.Textbox(label="Alias 操作状态", value="", interactive=False, lines=1)
+                                    eval_alias_df = gr.Dataframe(
+                                        headers=["Expected raw", "Cases", "Status", "Target file", "Suggestions", "Source"],
+                                        value=_eval_file_alias_rows(_parse_eval_dataset_id(eval_value)),
+                                        show_label=False,
+                                        interactive=False,
+                                        static_columns=[0, 1, 2, 3, 4, 5],
+                                        col_count=(6, "fixed"),
+                                        type="array",
+                                        wrap=False,
+                                        max_height=260,
+                                    )
+                                    with gr.Row():
+                                        eval_alias_raw = gr.Textbox(
+                                            label="Expected raw",
+                                            placeholder="例如：《投资学》 / 《公司理财》",
+                                            scale=2,
+                                        )
+                                        eval_alias_target = gr.Dropdown(
+                                            label="Target file",
+                                            choices=_uploaded_eval_file_names(),
+                                            value=(_uploaded_eval_file_names() or [None])[0],
+                                            interactive=True,
+                                            scale=2,
+                                        )
+                                    with gr.Row():
+                                        btn_eval_alias_save = gr.Button("保存 alias", variant="primary", size="sm")
+                                        btn_eval_alias_delete = gr.Button("删除 alias", variant="secondary", size="sm")
                     with gr.Column(scale=2, min_width=320):
                         gr.Markdown("##### 实验工具")
                         with gr.Accordion("批量问题回放", open=False):
@@ -4720,6 +6013,100 @@ def build_ui():
                                 wrap=False,
                                 max_height=260,
                             )
+                            eval_compare_df = gr.Dataframe(
+                                headers=[
+                                    "RUN ID",
+                                    "评测集",
+                                    "运行名称",
+                                    "Fingerprint",
+                                    "检索模式",
+                                    "向量",
+                                    "LLM",
+                                    "Embedding",
+                                    "Top-N",
+                                    "Top-K",
+                                    "候选命中率",
+                                    "上下文命中率",
+                                    "片段命中率",
+                                    "答案命中率",
+                                    "OK",
+                                    "Top attribution",
+                                ],
+                                value=_eval_run_compare_rows(),
+                                show_label=False,
+                                interactive=False,
+                                static_columns=list(range(16)),
+                                col_count=(16, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=260,
+                            )
+                            eval_diff_df = gr.Dataframe(
+                                headers=["对比项", "当前RUN", "上一RUN", "变化", "说明"],
+                                value=_eval_run_diff_rows(),
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2, 3, 4],
+                                col_count=(5, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=320,
+                            )
+                            baseline_status = gr.Textbox(label="Baseline 状态", value="", interactive=False, lines=1)
+                            btn_set_baseline = gr.Button("将当前评测集最新 RUN 设为 Baseline", variant="secondary", size="sm")
+                            cb_set_baseline_force = gr.Checkbox(
+                                label="强制覆盖（绕过数据集阻塞项）",
+                                value=False,
+                            )
+                            baseline_compare_df = gr.Dataframe(
+                                headers=["对比项", "最新RUN", "Baseline", "变化", "说明"],
+                                value=_eval_baseline_compare_rows(_parse_eval_dataset_id(eval_value)),
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1, 2, 3, 4],
+                                col_count=(5, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=260,
+                            )
+                            btn_param_grid = gr.Button("运行 retrieval-only 参数网格", variant="secondary", size="sm")
+                            gr.Markdown(
+                                "*排序口径：上下文命中率 → 片段命中率 → 候选命中率，降序。选参数组后顶部出现的就是当前数据集上表现最佳的取回口径。*",
+                                visible=True,
+                            )
+                            grid_status = gr.Textbox(label="参数网格日志", lines=3, max_lines=8, interactive=False)
+                            grid_df = gr.Dataframe(
+                                headers=["RUN ID", "Mode", "Rerank", "Top-N", "Top-K", "候选命中率", "上下文命中率", "片段命中率", "全标注候选命中率"],
+                                value=[["（暂无网格结果）", "", "", "", "", "", "", "", ""]],
+                                show_label=False,
+                                interactive=False,
+                                static_columns=list(range(9)),
+                                col_count=(9, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=220,
+                            )
+                        with gr.Accordion("平台运维", open=False):
+                            btn_ollama_health = gr.Button("检查 Ollama 健康", variant="secondary", size="sm")
+                            ollama_health_df = gr.Dataframe(
+                                headers=["项目", "值"],
+                                value=ollama_health_rows({}),
+                                show_label=False,
+                                interactive=False,
+                                static_columns=[0, 1],
+                                col_count=(2, "fixed"),
+                                type="array",
+                                wrap=False,
+                                max_height=180,
+                            )
+                            btn_export_eval_report = gr.Button("导出最新评测报告 JSON", variant="secondary", size="sm")
+                            btn_export_eval_compare = gr.Button(
+                                "导出逐题对比表 (原题+结果 xlsx)",
+                                variant="secondary",
+                                size="sm",
+                            )
+                            eval_report_file = gr.File(label="评测报告 / 对比表", interactive=False)
+                            btn_regression_eval = gr.Button("运行当前评测集检索回归", variant="secondary", size="sm")
 
                 _chat_inputs = [
                     msg,
@@ -4760,10 +6147,64 @@ def build_ui():
                         eval_llm_dd,
                         eval_llm_num_ctx,
                         eval_embed_dd,
+                        eval_generation_mode,
+                        eval_retrieval_mode,
                     ],
                     [batch_status, batch_result_df, session_table],
                 )
-                btn_compare.click(do_experiment_compare, outputs=[compare_df])
+                btn_compare.click(do_experiment_compare, outputs=[compare_df, eval_compare_df, eval_diff_df, baseline_compare_df])
+                btn_set_baseline.click(
+                    do_set_latest_eval_baseline,
+                    [eval_dataset_dd, cb_set_baseline_force],
+                    [baseline_status, baseline_compare_df],
+                )
+                btn_param_grid.click(
+                    do_run_retrieval_param_grid,
+                    [eval_dataset_dd],
+                    [grid_status, grid_df, eval_recent_runs_df, eval_compare_df, eval_diff_df, baseline_compare_df],
+                )
+                btn_eval_governance.click(
+                    do_eval_governance_refresh,
+                    [eval_dataset_dd],
+                    [eval_quality_df, eval_failure_df, eval_alias_df, eval_alias_target],
+                )
+                eval_alias_df.select(
+                    do_eval_alias_row_select,
+                    outputs=[eval_alias_raw, eval_alias_target],
+                )
+                btn_eval_alias_save.click(
+                    do_save_eval_file_alias,
+                    [eval_dataset_dd, eval_alias_raw, eval_alias_target],
+                    [eval_alias_status, eval_quality_df, eval_failure_df, eval_alias_df, eval_alias_target],
+                )
+                btn_eval_alias_delete.click(
+                    do_delete_eval_file_alias,
+                    [eval_dataset_dd, eval_alias_raw],
+                    [eval_alias_status, eval_quality_df, eval_failure_df, eval_alias_df, eval_alias_target],
+                )
+                btn_ollama_health.click(do_ollama_health_check, outputs=[ollama_health_df])
+                btn_export_eval_report.click(do_export_latest_eval_report, [eval_dataset_dd], [eval_report_file])
+                btn_export_eval_compare.click(
+                    do_export_latest_eval_case_compare,
+                    [eval_dataset_dd],
+                    [eval_report_file],
+                )
+                btn_regression_eval.click(
+                    do_run_retrieval_regression,
+                    [eval_dataset_dd],
+                    [
+                        eval_run_status,
+                        eval_run_result_df,
+                        eval_run_summary_df,
+                        eval_recent_runs_df,
+                        eval_run_params_df,
+                        eval_error_df,
+                        eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
+                    ],
+                )
                 btn_eval_import.click(
                     do_eval_dataset_import,
                     [eval_file, eval_dataset_name, eval_dataset_desc],
@@ -4778,6 +6219,13 @@ def build_ui():
                         eval_run_params_df,
                         eval_error_df,
                         eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
+                        eval_quality_df,
+                        eval_failure_df,
+                        eval_alias_df,
+                        eval_alias_target,
                     ],
                 )
                 eval_dataset_dd.change(
@@ -4792,6 +6240,13 @@ def build_ui():
                         eval_run_params_df,
                         eval_error_df,
                         eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
+                        eval_quality_df,
+                        eval_failure_df,
+                        eval_alias_df,
+                        eval_alias_target,
                     ],
                 )
                 btn_eval_run.click(
@@ -4809,6 +6264,9 @@ def build_ui():
                         eval_llm_dd,
                         eval_llm_num_ctx,
                         eval_embed_dd,
+                        eval_generation_mode,
+                        eval_retrieval_mode,
+                        eval_query_anchoring,
                     ],
                     [
                         eval_run_status,
@@ -4818,6 +6276,9 @@ def build_ui():
                         eval_run_params_df,
                         eval_error_df,
                         eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
                     ],
                 )
                 btn_eval_dashboard_refresh.click(
@@ -4831,6 +6292,9 @@ def build_ui():
                         eval_run_params_df,
                         eval_error_df,
                         eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
                     ],
                 )
                 eval_recent_runs_df.select(
@@ -4844,6 +6308,9 @@ def build_ui():
                         eval_run_params_df,
                         eval_error_df,
                         eval_tag_df,
+                        eval_file_df,
+                        eval_chunk_diag_df,
+                        eval_funnel_df,
                     ],
                 )
 
@@ -4863,6 +6330,8 @@ def build_ui():
                 kb_image_tesseract_lang,
                 kb_image_vision_model,
                 kb_image_ocr_skip,
+                kb_chroma_redirect_warn,
+                kb_chroma_redirect_ack_btn,
             ],
         )
         btn_refresh_models.click(
@@ -4916,3 +6385,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n[RAG-Lite] 运行失败，请查看上方报错。", flush=True)
         sys.exit(1)
+
+

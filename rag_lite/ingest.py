@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import gc
 import json
+import logging
 import os
 import re
 import shutil
@@ -29,6 +30,29 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from rag_lite.config import AppConfig
 from rag_lite.readers import default_local_file_extractors
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
+
+
+class _ChromaTelemetryNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Failed to send telemetry event" not in record.getMessage()
+
+
+_CHROMA_TELEMETRY_FILTER = _ChromaTelemetryNoiseFilter()
+
+
+def _quiet_chroma_telemetry_logs() -> None:
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_CHROMA_TELEMETRY_FILTER)
+    for name in ("chromadb.telemetry", "chromadb.telemetry.product", "chromadb.telemetry.product.posthog", "posthog"):
+        logger = logging.getLogger(name)
+        logger.addFilter(_CHROMA_TELEMETRY_FILTER)
+        logger.setLevel(logging.CRITICAL)
+
+
+_quiet_chroma_telemetry_logs()
 
 # 与 VectorStoreIndex.insert_batch_size 对齐；避免默认 2048 导致「一整根 2048 步」tqdm，看起来像反复在向量化
 _EMBED_BATCH_SIZE = 48
@@ -578,11 +602,16 @@ res = self_check_index(
 )
 print(json.dumps(res, ensure_ascii=False))
 """
+    # Force UTF-8 in the subprocess stdout: Windows default cp936/GBK would mangle
+    # the non-ASCII bytes produced by print(json.dumps(..., ensure_ascii=False)).
+    sub_env = os.environ.copy()
+    sub_env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         r = subprocess.run(
             [_project_python_executable(cfg), "-c", code, json.dumps(payload, ensure_ascii=False)],
             capture_output=True,
             text=False,
+            env=sub_env,
             timeout=180,
             check=False,
         )
@@ -1085,6 +1114,7 @@ def iter_build_index(
         "count_ok": bool((health or {}).get("count_ok")),
         "get_ok": bool((health or {}).get("get_ok")),
         "query_ok": bool((health or {}).get("query_ok")),
+        "diagnostics_ok": bool((health or {}).get("diagnostics_ok", True)),
         "error": str((health or {}).get("error") or ""),
         "missing_uploaded_files": list((health or {}).get("missing_uploaded_files") or []),
         "diagnostics_total_chunks": int((health or {}).get("diagnostics_total_chunks") or 0),
@@ -2172,6 +2202,7 @@ def self_check_index(
         "count_ok": False,
         "get_ok": False,
         "query_ok": False,
+        "diagnostics_ok": True,
         "count": 0,
         "sample_id": "",
         "sample_query": "",
@@ -2305,8 +2336,9 @@ def self_check_index(
             out["missing_uploaded_files"] = _missing_uploaded_filenames(expected_names, files)
         except Exception as e:
             # schema 差异（如 KeyError: '_type'）不再阻断索引上线
+            out["diagnostics_ok"] = False
             out["error"] = f"diagnostics skipped: {type(e).__name__}: {e}"
-        out["ok"] = True
+        out["ok"] = out["count_ok"] and out["get_ok"] and (out["query_ok"] or (not require_query))
         return out
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"

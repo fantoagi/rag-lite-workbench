@@ -1,74 +1,140 @@
-# Paths relative to project root (ragZone/) unless absolute.
+# =============================================================================
+# ragZone 主配置（config.yaml）
+# -----------------------------------------------------------------------------
+# - 路径类字段：相对路径均相对「项目根目录」（本文件所在目录），除非写绝对路径。
+# - 修改后一般需重启应用（或重新 load_config）才会生效。
+# - System Prompt 正文已独立到 prompts/ 目录，本文件只保留版本指针与路径。
+# =============================================================================
+
+# --- 数据与索引落盘位置 -------------------------------------------------------
+# data_dir: 业务数据根目录（上传文件、SQLite、导出、UI 偏好等）
 data_dir: ./data
+# uploads_subdir: 上传原文相对 data_dir 的子目录
 uploads_subdir: uploads
+# chroma_subdir: Chroma 向量库相对 data_dir 的子目录名
+# 注意：Windows 下若项目路径含非 ASCII，实际 chroma 可能自动重定向到
+#   %LOCALAPPDATA%/ClaudeCode/rag_lite_chroma/<slug>/chroma
+# 也可用绝对路径字段 chroma_dir 强制指定（见 rag_lite/config.py）
 chroma_subdir: chroma
+# sqlite_filename: 实验/文档元数据等 SQLite 库文件名（位于 data_dir 下）
 sqlite_filename: rag_lite.db
+# collection_name: Chroma collection 名称（同名索引共用；换分块策略通常需重建）
 collection_name: rag_lite
 
+# --- Ollama / 模型 ------------------------------------------------------------
 ollama:
+  # base_url: Ollama HTTP API 地址
   base_url: http://127.0.0.1:11434
-  # 默认模型；界面下拉会与 Ollama /api/tags 合并，并记住上次选择（data/ui_preferences.json）
+  # llm_model: 默认对话生成模型；界面下拉会与 /api/tags 合并，并记住上次选择（data/ui_preferences.json）
   llm_model: qwen2.5:0.5b
+  # embed_model: 入库与检索用的嵌入模型（须与已建索引一致，否则需重建）
   embed_model: bge-m3
-  # 可选：预置多候选名（与 ollama 列表合并，便于对比实验）
+  # llm_models / embed_models: 可选预置候选名列表，与 ollama 已安装列表合并，便于对比实验
   # llm_models:
   #   - qwen2.5:7b
   # embed_models:
   #   - bge-m3
-  # 对话流式生成：读超时过短易 httpx.ReadTimeout；本机 CPU 慢或上下文长时可再加大
+  # request_timeout: 对话/生成请求读超时（秒）。流式生成过短易 httpx.ReadTimeout；CPU 慢或上下文长时可加大
   request_timeout: 600.0
+  # connect_timeout: 连接 Ollama 的超时（秒）
   connect_timeout: 60.0
+  # embed_retry_attempts: 嵌入失败时的额外重试次数（不含首次）
   embed_retry_attempts: 2
-  # 部分 Qwen 等模型支持「思考链」；开启时流式可能长时间无正文，界面卡在「正在生成」
+  # thinking: 部分 Qwen 等模型的「思考链」开关；开启时流式可能长时间无正文，界面易卡在「正在生成」
   thinking: false
-  # 发给 LLM 的用户消息（含检索片段）最大字符数，过大易首 token 极慢或超时
+  # max_llm_context_chars: 发给 LLM 的用户消息（含检索片段拼装）最大字符数；过大易首 token 极慢或超时
   max_llm_context_chars: 100000
-  # 对话请求里的 num_ctx（LlamaIndex 的 context_window）。Modelfile 若设成 26 万级易吃满显存并回退 CPU；
-  # 工作台默认用较小值更易走 GPU；需要更大可改为 32768、65536，或 -1 表示跟随模型/服务端
+  # num_ctx: 对话请求的上下文窗口（LlamaIndex context_window / Ollama num_ctx）
+  # Modelfile 若设成极大值易吃满显存并回退 CPU；默认偏小更易走 GPU。
+  # 可改为 32768、65536；-1 表示跟随模型/服务端默认
   num_ctx: 16384
 
+# --- 入库 / 解析 --------------------------------------------------------------
 ingest:
+  # max_file_size_mb: 单文件上传大小上限（MB）
   max_file_size_mb: 50
-  # 验证环境默认先关闭图片增强，优先保证构建速度与主流程稳定；需要验证图片内容时再手动开启
-  # 为 true 时：PDF/DOCX 内嵌图先 OCR（ingest.ocr_engine：tesseract / paddleocr），文本过短再调 Ollama 视觉模型；需对应依赖与 pull 视觉模型
+  # image_enrichment: 是否对 PDF/DOCX 内嵌图做 OCR/视觉增强后再参与分块检索
+  # 验证环境默认关闭，优先构建速度与主流程稳定；需要验证图片内容时再开启
+  # 为 true 时：内嵌图先 OCR（ocr_engine），文本过短再调 Ollama 视觉模型；需对应依赖与 pull 视觉模型
   image_enrichment: false
+  # vision_model: 图片描述用的 Ollama 视觉模型名
   vision_model: glm-ocr:latest
+  # vision_prompt: 调用视觉模型时的提示词
   vision_prompt: "请用1-3句中文简要描述图中内容，便于检索；若有文字请尽量读出关键信息。"
-  # OCR 字符数 ≥ 此值则不再调用视觉模型（节省构建时间）
+  # ocr_skip_vlm_min_chars: OCR 结果字符数 ≥ 此值则不再调用视觉模型（节省构建时间）
   ocr_skip_vlm_min_chars: 8
+  # max_images_per_file: 单文件最多处理的内嵌图数量
   max_images_per_file: 5
+  # min_image_side_px / max_image_side_px: 过滤过小图、缩放过大图的边长阈值（像素）
   min_image_side_px: 24
   max_image_side_px: 768
-  # OCR 引擎：tesseract | paddleocr（Paddle 需单独安装，见 requirements-paddleocr.txt）
+  # ocr_engine: OCR 引擎。tesseract | paddleocr（Paddle 需单独安装，见 requirements-paddleocr.txt）
   ocr_engine: tesseract
+  # tesseract_lang: Tesseract 语言包，如 chi_sim+eng
   tesseract_lang: chi_sim+eng
-  # Chroma HNSW 持久化参数：Windows 下取过大值会触发巨量内存申请，导致只写出 sqlite 而 HNSW 文件不完整。
-  # 这里改回保守值，优先保证索引能真正落盘并可查询；需要更高吞吐时再逐步上调。
+  # chroma_hnsw_*: Chroma HNSW 持久化参数。
+  # Windows 下取值过大可能触发巨量内存申请，导致只写出 sqlite 而 HNSW 文件不完整。
+  # 保守默认优先保证索引真正落盘可查；需要更高吞吐时再逐步上调。
   chroma_hnsw_sync_threshold: 1000
   chroma_hnsw_batch_size: 100
-  # Windows 若未把 tesseract 加入 PATH，可填绝对路径，例如：
+  # tesseract_cmd: Windows 若未把 tesseract 加入 PATH，可填绝对路径，例如：
   # tesseract_cmd: "C:/Program Files/Tesseract-OCR/tesseract.exe"
 
+# --- 重排序 -------------------------------------------------------------------
 rerank:
+  # enabled_default: 检索后是否默认启用 Cross-Encoder 重排（界面可覆盖）
+  # evidence 集：hybrid n30k16 + bge-reranker-v2-m3 相对无 rerank Evidence 约 51.3%→53.9%，
+  # 但 CPU 全量很慢；默认关闭，离线追分时再开。
   enabled_default: false
+  # model_name: HuggingFace / 本地重排模型标识
   model_name: BAAI/bge-reranker-v2-m3
+  # device: 推理设备。null=自动；也可写 "cpu" / "cuda" 等
   device: null
 
+# --- 检索与回答用片段 ---------------------------------------------------------
 retrieval:
+  # top_n_default: 初检召回条数（hybrid/vector/keyword 池大小，界面可覆盖）
+  # 经验：N 过小漏召回，过大增加噪声与重排成本
   top_n_default: 30
-  top_k_default: 8
+  # top_k_default: 进入「最终检索结果 / 评测 Evidence」的片段数上限
+  # evidence 网格：hybrid N=30 时 K=8/12/16 → 约 43.4%/48.7%/51.3%；默认 16
+  top_k_default: 16
+  # answer_top_k: 实际拼进 LLM 上下文的片段数上限（可 ≤ top_k）
+  # e2e 显示 K=16 易串文档；生成侧收紧到 6–8 可减少套话/串源，但可能裁掉靠后的金标片段
+  answer_top_k: 8
 
+# --- 分块（变更后通常需重建索引）---------------------------------------------
 chunking:
+  # chunk_mode_default: 分块策略。sentence | paragraph | token
+  # evidence A/B：sentence/384/128 ≈52.6% > paragraph/384/128 ≈51.3% > token ≈48.7% > paragraph/512 ≈46.1%
+  chunk_mode_default: sentence
+  # chunk_size_default: 目标块大小（字符或 token，依模式；SentenceSplitter 语义见引擎实现）
   chunk_size_default: 384
+  # chunk_overlap_default: 相邻块重叠，减轻边界截断导致的证据丢失
   chunk_overlap_default: 128
 
+# --- System Prompt（正文在独立文件，便于版本对比与 A/B）------------------------
 prompt:
-  version: "v1"
-  system_default: |
-    你是一个严谨的助手。请仅根据下面「已知上下文」回答问题；若上下文没有相关信息，请明确说「根据已知材料无法回答」，不要编造。
+  # version: 当前启用的 prompt 版本号；写入对话/评测元数据，便于复现
+  # 若未指定 system_file，则自动加载 {dir}/system_{version}.txt
+  version: "v2"
+  # dir: prompt 文件目录（相对项目根）
+  dir: ./prompts
+  # system_file: 显式指定系统提示词文件（优先于 dir+version 约定）
+  # 切换版本示例：
+  #   version: "v1"
+  #   system_file: ./prompts/system_v1.txt
+  system_file: ./prompts/system_v2.txt
+  # 说明：加载后会注入为内部字段 system_default，供 UI/引擎使用；
+  # 请勿再在本文件内联大段 system_default（已废弃）。
 
+# --- Gradio UI ----------------------------------------------------------------
 ui:
+  # server_name: 监听地址。127.0.0.1=仅本机；0.0.0.0=局域网可访问
   server_name: 127.0.0.1
+  # server_port: HTTP 端口
   server_port: 7860
+  # share: 是否创建 Gradio 公网临时链接（一般本地调试保持 false）
   share: false
+  # open_browser: 启动后是否自动打开浏览器
   open_browser: true

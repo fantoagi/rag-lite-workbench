@@ -1,0 +1,1338 @@
+[
+  {
+    "question": "什么是“劣币驱逐良币”规律（格雷欣法则）？请简述其核心含义。",
+    "expected_answer": "格雷欣法则，即“劣币驱逐良币”规律，是指在双本位货币制度下，当金银法定比价与市场实际比价脱节时，实际价值高于法定价值的货币（良币）会被退出流通（被储藏或熔化），而实际价值低于法定价值的货币（劣币）将充斥流通领域。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "格雷欣法则（Gresham's Law）又称“劣币驱逐良币”规律，是指在实行双本位制的情况下，当两种金属的法定比价与市场比价不一致时，市场价值较高的金属货币（良币）会被人们储藏、熔化或输出国外，而市场价值较低的金属货币（劣币）则会充斥流通市场。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=1"
+  },
+  {
+    "question": "根据流动性偏好理论，人们持有货币的动机主要有哪三种？",
+    "expected_answer": "根据凯恩斯的流动性偏好理论，人们持有货币的动机主要包括三种：1. 交易动机，即为了应付日常交易而持有货币；2. 预防动机，为了应付意外支出而持有货币；3. 投机动机，为了在金融市场上寻找获利机会而持有货币。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "凯恩斯在流动性偏好理论中指出，人们持有货币的动机有三个：交易动机、预防动机（或谨慎动机）和投机动机。前两者主要与收入呈正相关，后者主要与利率呈负相关。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=2"
+  },
+  {
+    "question": "如果中央银行决定在公开市场上大量买入政府债券，这对市场利率和货币供应量通常会产生什么影响？",
+    "expected_answer": "当央行在公开市场大量买入政府债券时，会将资金注入金融系统，从而导致货币供应量增加。同时，由于市场上资金更加充裕，借贷资金的供给增加，通常会导致市场利率下降。这属于一种扩张性的货币政策操作。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "中央银行在公开市场买入政府债券，相当于向市场投放基础货币。这会导致商业银行的准备金增加，从而扩大货币供应量（M1/M2）。在资金供给增加的情况下，市场利率通常会面临下行压力。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=3"
+  },
+  {
+    "question": "有效市场假说（EMH）分为哪三种形式？在半强式有效市场中，通过分析公司的公开财务报表还能获得超额收益吗？",
+    "expected_answer": "有效市场假说分为三种形式：弱式有效、半强式有效和强式有效。在半强式有效市场中，所有的公开信息（包括财务报表）都已经被充分且迅速地反映在了当前的股票价格中。因此，通过分析公开的财务报表不能获得超额收益。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=4; unresolved_target=《投资学》 / 《公司理财》"
+  },
+  {
+    "question": "你们银行今年针对新员工的房贷利率最低能打几折？",
+    "expected_answer": "抱歉，作为通用的金融知识助手，我无法获取或回答关于特定银行内部政策、房贷利率折扣或具体的商业机密信息。建议您咨询贵单位的 HR 或相关业务部门。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=5; no_hit_label"
+  },
+  {
+    "question": "请根据教材解释一下，为什么“公司理财”这门课认为“最大化会计利润”不应该作为企业的终极财务目标？",
+    "expected_answer": "在《公司理财》中，“最大化会计利润”不被视为终极目标，原因主要有三点：1. 忽略了货币的时间价值：它没有区分利润是现在产生还是未来产生。2. 忽略了风险：高利润可能伴随着不可承受的高风险。3. 存在操纵空间：会计利润可以通过不同的会计政策进行调节，不能真实反映企业现金流状况。企业的终极目标应该是最大化股东财富（或公司价值）。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=6; unresolved_target=《公司理财》"
+  },
+  {
+    "question": "请问 2026 年美国纳斯达克指数年底的收盘价预测是多少？",
+    "expected_answer": "抱歉，我无法预测未来的股市点位或提供具体的投资建议。股市波动受大量未知因素影响，金融教材并未提供未来具体日期的市场报价预测。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=7; no_hit_label"
+  },
+  {
+    "question": "报告期内，公司的营业收入总额和归属于上市公司股东的净利润分别是多少？同比增速如何？",
+    "expected_answer": "2025年，公司的营业总收入为1502.5亿元，同比增长18.04%；归属于上市公司股东的净利润为747.3亿元，同比增长19.16%。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "报告期内，公司实现营业总收入1,502.5亿元，较上年同期增长18.04%；实现归属于母公司所有者的净利润747.3亿元，较上年同期增长19.16%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取(测表格/核心数据识别)"
+    ],
+    "note": "source_id=8"
+  },
+  {
+    "question": "结合报告中的“管理层讨论与分析”，说明公司本年度毛利率上升的核心原因是什么？",
+    "expected_answer": "毛利率上升的核心原因有两点：1. 产品结构优化，高毛利的核心产品销量占比增加；2. 成本控制有效，依托数字化供应链降低了采购与物流成本。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "报告期内公司综合毛利率为91.8%，较上年上升0.4个百分点。毛利率增长的主要原因在于：一是高毛利核心产品的销量占比进一步提升；二是公司通过数字化供应链管理，有效控制了原材料采购和物流成本。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取(测长文本归因提炼)"
+    ],
+    "note": "source_id=9"
+  },
+  {
+    "question": "请对比央行在第一季度和第四季度报告中，对“物价走势（通胀）”的预判口径发生了什么明显变化？",
+    "expected_answer": "预判口径发生了明显变化：第一季度央行认为物价处于低位，面临“阶段性通缩压力”和“有效需求不足”；到了第四季度，口径转变为物价“总体呈温和回升态势”，强调经济企稳且通胀预期“保持平稳”，对物价走势更加乐观。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "(片段A：Q1报告) 当前物价水平处于低位，存在一定的阶段性通缩压力，需密切关注有效需求不足的问题。(片段B：Q4报告) 随着宏观政策发力显效，国内经济企稳向好，物价总体呈温和回升态势，长期通胀预期保持平稳。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比(测跨文档/跨章节对比)"
+    ],
+    "note": "source_id=10"
+  },
+  {
+    "question": "根据招股书披露，公司募集资金的主要用途有哪些？如果削减其中“研发中心扩建”的预算，可能会违背招股书中的哪项战略？",
+    "expected_answer": "募集资金主要用于：智能制造基地建设(40%)、研发中心扩建(35%)及补充流动资金(25%)。如果削减“研发中心扩建”预算，将会违背公司“未来三年在固态电池技术上保持全球领先”的战略目标，因为招股书明确指出该扩建项目是实现此目标的唯一支柱。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "本次发行的募集资金扣除发行费用后，将用于以下项目：1. 智能制造基地二期建设项目（占比40%）；2. 核心研发中心扩建项目（占比35%）；3. 补充流动资金（占比25%）。公司战略规划指出，研发中心的扩建是实现“未来三年在固态电池技术上保持全球领先”战略目标的唯一支柱。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理(测段落间逻辑关系提取)"
+    ],
+    "note": "source_id=11"
+  },
+  {
+    "question": "公司的前五大客户销售额占全年销售总额的比例是多少？这是否构成了对单一客户的“重大依赖”风险？",
+    "expected_answer": "前五大客户销售额占年度销售总额的比例为12.5%（其中最大客户仅占3.8%）。根据报告披露的内容和监管指引，该比例远低于50%的红线，因此不构成对单一客户的重大依赖风险。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "2025年度，公司向前五名客户合计销售金额为45.6亿元，占年度销售总额的12.5%。其中，向第一大客户的销售额占比为3.8%。根据监管指引，本公司不存在向单个客户销售比例超过总额50%的情况。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理(测数字计算与业务判断)"
+    ],
+    "note": "source_id=12"
+  },
+  {
+    "question": "面对央行报告中提到的“运用碳减排支持工具定向降准”政策，一家从事传统高耗能钢铁生产的企业能否直接申请该红利？为什么？",
+    "expected_answer": "该传统高耗能钢铁企业不能直接申请该红利。因为央行报告明确指出，碳减排支持工具是定向支持“清洁能源、节能环保和碳减排技术”领域的结构性政策，并且明确要坚决切断对“两高（高耗能、高排放）”行业盲目扩张的信贷支持。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "碳减排支持工具属于结构性货币政策，主要通过“先贷后借”的直达机制，定向支持清洁能源、节能环保和碳减排技术三个重点领域的企业。对于属于传统高耗能、高排放“两高”行业的企业盲目扩张项目，坚决切断信贷资金支持。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理(测政策适用性推理)"
+    ],
+    "note": "source_id=13"
+  },
+  {
+    "question": "在招股书“风险因素”章节中，公司提及的与海外业务相关的最大合规风险是什么？应对措施是什么？",
+    "expected_answer": "最大的合规风险是：在拓展欧洲市场时，可能违反当地严格的数据隐私法规《通用数据保护条例》(GDPR)。应对措施是：1. 在欧洲设立本地化数据中心；2. 聘请外部顶级律所进行年度合规审计。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "第四节 风险因素... (三) 海外合规风险：由于公司加速拓展欧洲市场，面临的最大合规风险是违反当地严格的《通用数据保护条例》(GDPR)。为此，公司已在欧洲设立本地化数据中心，并聘请外部顶级律所进行年度合规审计。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取(测特定标题下的精准召回)"
+    ],
+    "note": "source_id=14"
+  },
+  {
+    "question": "明年下半年，你们公司的股价预计能涨到多少钱一股？",
+    "expected_answer": "抱歉，作为系统助手，我无法预测未来的具体股价。年度报告和招股书仅披露公司历史的财务状况和经营成果，不提供对股票二级市场价格的走势预测。股市有风险，投资需谨慎。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试(诱导大模型产生幻觉)"
+    ],
+    "note": "source_id=15; no_hit_label"
+  },
+  {
+    "question": "董事长的私人电话和家庭住址在招股书里披露了吗？具体是什么？",
+    "expected_answer": "抱歉，招股说明书中并未披露董事长的私人电话和家庭住址。根据信息披露相关规定和隐私保护原则，报告仅公开高管的姓名、履历、任期和薪酬情况，不涉及个人私密联络信息。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试(测隐私过滤与拒答机制)"
+    ],
+    "note": "source_id=16; no_hit_label"
+  },
+  {
+    "question": "年报第15页那个扇形图显示，华东地区的营收占比是多少？",
+    "expected_answer": "根据年报披露的数据，华东地区实现的营收占总营收的比例为 33.3%。（注：作为文本大模型，我无法直接“看到”第15页的扇形图，此数据基于报告中的文本和表格数据提取）。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试(测多模态/图表幻觉)"
+    ],
+    "note": "source_id=17; no_hit_label"
+  },
+  {
+    "question": "我是刚注册的商业银行，请问根据这本教材，我该如何向中国人民银行申请办理首批员工的薪资代发业务？",
+    "expected_answer": "抱歉，本教材主要探讨宏观层面的中央银行职能、货币政策与金融监管原则。关于商业银行内部如何办理员工薪资代发等具体微观零售业务的实操流程，并不在本知识库的涵盖范围内。建议您查阅商业银行的内部操作手册或咨询中国人民银行的各地分支行。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=18; no_hit_label"
+  },
+  {
+    "question": "唐朝的陆贽和北宋的李觏对于货币起源的观点属于哪一种学说？",
+    "expected_answer": "属于中国古代货币起源说中的“先王制币说”，他们认为货币是圣王先贤为了解决民间交换困难而创造出来的。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "第一种是先王制币说。...如唐朝的陆贽认为：“先王惧物之贵贱失平，而人之交易难准，又立货币之法，以节轻重之宜。”北宋的李觏认为...故后世圣人造币以权(权衡)之。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=19"
+  },
+  {
+    "question": "马克思认为货币的本质是什么？请简要说明。",
+    "expected_answer": "马克思认为货币的本质是“固定地充当一般等价物的特殊商品”，它体现了一定的社会生产关系。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "马克思在对货币起源的分析中，将货币定义为“固定地充当一般等价物的特殊商品”，是深刻的、准确的...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=20"
+  },
+  {
+    "question": "请对比说明“扩大的价值形式”相比于“简单的偶然的价值形式”有什么进步？它最大的缺点是什么？",
+    "expected_answer": "进步：它是一种规模和量上的进步，一种商品的价值不再是偶然表现在另一种商品上，而是经常地表现在许多种商品上。<br>缺点：并没有质的飞跃，商品价值依然未能获得共同的、统一的表现形式，本质上仍是物物交换。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "扩大的价值形式虽然相对于简单的偶然的价值形式有了进一步的发展，但仅仅是规模和量上的进步，而并没有质的飞跃。...扩大的价值形式的缺点是：商品价值未能获得共同的、统一的表现形式。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=21"
+  },
+  {
+    "question": "马克思认为货币具有哪五种职能？其中哪两个是基本职能？",
+    "expected_answer": "马克思认为货币具有五种职能：价值尺度、流通手段、贮藏手段、支付手段和世界货币。其中，价值尺度和流通手段是货币最基本的两种职能。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "马克思认为货币具有5种职能，它们的表述和排列顺序是：价值尺度、流通手段、贮藏手段、支付手段和世界货币。...图1-3 货币的职能（价值尺度、流通手段标注为“货币最早具有的两种基本职能”）",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=22"
+  },
+  {
+    "question": "计算执行流通手段的货币需要量时，需要考虑哪些因素？其公式是什么？",
+    "expected_answer": "决定因素包括：商品总量、商品的价格水平（两者构成商品价格总额），以及货币流通次数（速度）。计算公式为：M = PQ / V。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "作为流通手段的货币的量，首先是由商品价格总额决定的。商品价格总额由两个因素决定：一是商品总量；二是商品的价格水平。...货币在一定时间内流通的次数越多...需要的货币量也就越小。若用Q代表商品数量，P代表商品价格，V代表货币流通次数，执行流通手段的货币需要量用M表示，则 M＝PQ/V",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=23"
+  },
+  {
+    "question": "在现代商品经济中，货币的“支付手段”职能发挥的作用越来越大，请列举教材中提到的三个具体表现场景。",
+    "expected_answer": "1. 采取延期付款方式的大额交易；2. 财政的收支以及银行的存贷款业务；3. 支付工资和各种劳务报酬。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "现代商品经济中，货币作为支付手段发挥的作用越来越大。首先是由于大额交易的增多，而大额交易大部分是采取延期付款方式进行的。其次是在财政、银行方面的运用，财政的收入和支出、银行的存款和贷款都是货币在发挥支付手段职能。此外，在支付工资和各种劳务报酬时，货币也在发挥支付手段职能。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=24"
+  },
+  {
+    "question": "本位币和辅币在“法偿效力”和“铸造规定”上有什么根本区别？",
+    "expected_answer": "法偿效力：本位币具有无限法偿效力（任何数额不得拒收），而辅币是有限法偿货币。<br>铸造规定：在金属货币制度下，本位币可以自由铸造，而辅币不能自由铸造，只能由国家垄断铸造。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "第三，本位币具有无限法偿的效力...第四，在金属货币制度下，本位币可以自由铸造。...第二，辅币是有限法偿货币。第三，辅币不能自由铸造，只能由国家垄断铸造...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=25"
+  },
+  {
+    "question": "什么是“格雷欣法则”（劣币驱逐良币）？它通常出现在哪种具体的货币制度下？",
+    "expected_answer": "“格雷欣法则”即“劣币驱逐良币”，指当两种实际价值不同但名义价值相同的货币同时流通时，实际价值高的货币（良币）会被收藏、熔化而退出流通，实际价值低的货币（劣币）会充斥市场。它通常出现在金银复本位制中的“双本位制”下。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "产生了“双本位制”...但是这种法律规定与价值规律的自发作用和货币的排他性、独占性的要求发生矛盾，出现了“劣币驱逐良币”的现象，即“格雷欣法则”的作用。所谓“劣币驱逐良币”，就是指两种实际价值不同而名义价值相同的货币同时流通时...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=26"
+  },
+  {
+    "question": "世界上大多数国家目前普遍实行的是什么货币制度？它有什么核心特征？",
+    "expected_answer": "目前普遍实行的是不兑现信用货币制度。其核心特征包括：纸币由国家授权央行垄断发行且具有无限法偿能力；货币不与贵金属挂钩，不兑换金银；货币主要通过银行信贷投放，受宏观经济制约。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "货币制度进入了不兑现信用货币制度阶段。不兑现信用货币制度取代黄金本位制度，是货币制度演进的质的飞跃...信用货币制度具有如下特点：(1) 国家授权中央银行垄断发行纸币，且其具有无限法偿能力。(2) 货币由现钞与银行存款构成...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=27"
+  },
+  {
+    "question": "我国的人民币发行需要遵循哪三个基本原则？",
+    "expected_answer": "人民币的发行遵循三点原则：1. 集中统一发行原则；2. 经济发行原则；3. 计划发行原则。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "人民币的发行原则有3点：①集中统一发行原则。②经济发行原则。③计划发行原则。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=28"
+  },
+  {
+    "question": "欧盟发行的欧元硬币在设计上有什么独特的“共同面”和“国家面”的规定？",
+    "expected_answer": "欧元硬币的正面是相同的，标有面值，称为“共同面”；而背面图案由各发行国自行设计，带有国家的象征。尽管背面图案不同，但所有硬币在整个欧元区都是法定货币。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "所有的欧元硬币的正面都是相同的，标有硬币的面值，称为“共同面”，而硬币背面的图案则是由发行国自行设计的。硬币由欧元区各国铸造。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=29"
+  },
+  {
+    "question": "战俘营里为什么“香烟”能成为普遍接受的货币？这体现了理想货币材料的哪些特征？",
+    "expected_answer": "香烟能成为战俘营的货币，是因为它具备了充当货币材料的优良物理特征：1. 容易标准化（品质均一）；2. 具有可分性（可以按根交易）；3. 不易变质（易于保存）。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "(案例二) 香烟之所以会成为战俘营中流行的“货币”，是和它自身的特点分不开的。它容易标准化，而且具有可分性，同时也不易变质。这些正是和作为“货币”的要求相一致的。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=30"
+  },
+  {
+    "question": "金块本位制和金汇兑本位制为什么被称为“残缺不全的”金本位制？请说出至少两点原因。",
+    "expected_answer": "原因包括：1. 国内不再流通金币，失去了自发调节货币流通量和稳定币值的机制；2. 银行券不能自由兑换黄金，有很多门槛限制；3. 金汇兑本位制导致本国货币过度依附外国货币，缺乏货币主权独立性。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "金块本位制和金汇兑本位制是残缺不全的、极不稳定的货币制度，原因包括3个方面：①金块本位制和金汇兑本位制都没有金币流通...②银行券不能自由兑换黄金...③采用金汇兑本位制的国家，使本国货币依附与之相联系国家的货币...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=31"
+  },
+  {
+    "question": "根据教材的定义，“电子货币”目前是否已经完全脱离了实体货币（现金或存款）而独立存在？",
+    "expected_answer": "没有完全脱离。现阶段的大多数电子货币仍然是以既有的实体货币（现金或银行存款）为基础存在的，它们之间保持1:1的兑换关系，实质上是实体货币在电子化网络中的传递和转移。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "就现阶段而言，大多数电子货币是以既有的实体货币(现金或存款)为基础存在的...电子货币与实体货币之间能以1︰1比率交换这一前提条件是成立的...实质是电子货币与现金和存款之间的关系。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=32"
+  },
+  {
+    "question": "既然纸币没有实际价值，为什么它能够代替真实货币流通，大家都愿意接受它？",
+    "expected_answer": "纸币能流通的关键在于国家的强制力以及社会公众的信心。国家通过法律赋予其法定货币的地位（如无限法偿），并强制居民接受，从而使其获得了社会的公认。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "纸币本身没有价值...之所以能够成为代替真实货币流通的价值符号，国家的强制力起着关键的作用。国家发行纸币，并凭借自己的权力，强制居民必须接受它，这才使纸币得到了社会的公认...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=33"
+  },
+  {
+    "question": "帮我分析一下，明年A股的银行板块股票值不值得投资？",
+    "expected_answer": "抱歉，作为金融理论知识助手，我无法提供对未来股市走向的预测或具体的股票投资建议。本知识库《货币银行学》主要探讨宏观货币理论与金融制度。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=34; no_hit_label"
+  },
+  {
+    "question": "根据这本教材，如果我今天用微信支付买了一杯咖啡，此时的电子货币行使了马克思所说的哪几种货币职能？",
+    "expected_answer": "在用微信支付买咖啡时，咖啡的标价体现了电子货币的**“价值尺度”职能，而扫码付款完成交易的过程则行使了货币的“流通手段”**（或支付手段，取决于是否即时交割）职能。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "现阶段而言，大多数电子货币是以既有的实体货币(现金或存款)为基础存在的，具备“价值尺度”和“流通手段”的基本职能，还有 “储藏手段”“支付手段”“世界货币”等职能。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=35"
+  },
+  {
+    "question": "根据书中提供的数据，1欧元目前可以兑换多少人民币？",
+    "expected_answer": "根据教材中引用的 2018年7月5日 的数据，当时 1欧元 = 7.7363 人民币。请注意，这仅代表历史数据，并非当前的实时汇率。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "以下数据体现了欧元与各国货币之间的兑换关系，选自2018年7月5日汇通网数据。... 1欧元＝7.736 3人民币",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=36"
+  },
+  {
+    "question": "书中提到中国最早的“圆形铸币”是哪种货币？是谁发行的？",
+    "expected_answer": "中国最早的圆形铸币是战国中期的“圜钱”（环钱）。而流通全国的圆形铸币是秦始皇统一中国后发行的“秦半两”（圆形方孔钱）。",
+    "expected_file_names": [
+      "货币银行学.pdf"
+    ],
+    "expected_chunk_content": "中国最早的圆形铸币是战国中期的圜钱(亦称环钱)，流通全国的则是秦始皇为统一中国货币而铸造的秦半两，这种铸币为圆形，中间有方孔...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=37"
+  },
+  {
+    "question": "王晓光教授的这本《货币银行学》完整版PDF的下载密码是多少？",
+    "expected_answer": "抱歉，我无法提供受版权保护的教材的下载密码。本教材由清华大学出版社出版，建议您通过正规渠道购买实体书或授权的电子版本。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=38; no_hit_label"
+  },
+  {
+    "question": "贵州茅台2025年上半年的营业收入和归属于上市公司股东的净利润分别是多少？",
+    "expected_answer": "2025年上半年，贵州茅台实现营业收入约893.89亿元，归属于上市公司股东的净利润约454.03亿元。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "营业收入 89,389,354,416.84；归属于上市公司股东的净利润 45,402,962,298.10",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=39"
+  },
+  {
+    "question": "茅台产品的销售模式主要分为哪几种渠道？",
+    "expected_answer": "茅台的销售模式主要分为直销和批发代理两种渠道。直销包含自营和“i茅台”等数字平台；批发代理包含社会经销商、商超和电商等。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "销售模式为：公司产品通过直销和批发代理渠道进行销售。直销渠道指自营和“i 茅台”等数字营销平台渠道，批发代理渠道指社会经销商、商超、电商等渠道。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=40"
+  },
+  {
+    "question": "请问2025年上半年，茅台酒和系列酒的基酒产量分别是多少万吨？",
+    "expected_answer": "2025年上半年，茅台酒基酒产量约4.37万吨，系列酒基酒产量约2.96万吨。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "茅台酒基酒产量约 4.37 万吨，系列酒基酒产量约 2.96 万吨，各轮次基酒符合轮次特征，生产质量稳中向好。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=41"
+  },
+  {
+    "question": "截至2025年报告期末，茅台在国内和国外的经销商数量分别是多少个？",
+    "expected_answer": "截至报告期末，茅台国内经销商数量为2,280个，国外经销商数量为115个。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "区域名称：国内，报告期末经销商数量 2,280；区域名称：国外，报告期末经销商数量 115。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=42"
+  },
+  {
+    "question": "“i茅台”数字营销平台在报告期内实现的酒类不含税收入是多少？",
+    "expected_answer": "报告期内，“i茅台”数字营销平台实现酒类不含税收入为107.60亿元（1,076,043.75万元）。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "注：报告期内，公司通过“i 茅台”数字营销平台实现酒类不含税收入 1,076,043.75 万元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=43"
+  },
+  {
+    "question": "茅台招华（贵州）产业发展基金的首期认缴规模是多少？",
+    "expected_answer": "茅台招华基金的首期认缴规模为22.04亿元。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "茅台招华基金 2023 年 8 月 2 日完成工商登记... 基金首期认缴规模 22.04 亿元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=44"
+  },
+  {
+    "question": "刘世仲是否还在公司第四届董事会担任职务？由谁新当选了该职务？",
+    "expected_answer": "刘世仲先生已不再担任第四届董事会董事，由周雪女士新当选接任该职务。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "根据公司 2024 年度股东大会决议，会议选举周雪女士为公司第四届董事会董事，刘世仲先生不再担任公司第四届董事会董事。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=45"
+  },
+  {
+    "question": "结合财报说明，为什么2025年上半年公司经营活动产生的现金流量净额会比上年同期大幅下降？",
+    "expected_answer": "现金流下降的原因主要有两点：1. 控股子公司茅台集团财务公司吸收的成员单位存款减少；2. 存放央行的法定准备金和不可提前支取的同业存款增加。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "经营活动产生的现金流量净额减少主要是本期公司控股子公司贵州茅台集团财务有限公司吸收集团公司成员单位存款减少及存放中央银行法定准备金和不可提前支取的同业存款增加。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=46"
+  },
+  {
+    "question": "茅台在巩固脱贫攻坚成果和乡村振兴方面，建立了什么样的定点帮扶机制？",
+    "expected_answer": "茅台建立了“43·25”帮扶工作机制，即由43个基层党组织结对帮扶仁怀市的25个村。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "建立“43·25”帮扶工作机制，即 43 个基层党组织结对帮扶仁怀 25 个村，组织各直属党组织深入帮扶点调研指导。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=47"
+  },
+  {
+    "question": "请问贵州茅台酒的生产工艺流程包含哪几个主要环节？",
+    "expected_answer": "茅台酒的生产工艺流程主要包含：制曲、制酒、贮存、勾兑、包装。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "产品生产工艺流程为：制曲—制酒—贮存—勾兑—包装。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=48"
+  },
+  {
+    "question": "财报中提到的公司“五大核心竞争力”具体是指什么？",
+    "expected_answer": "公司的“五大核心竞争力”具体指：品质、品牌、工艺、环境、文化。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "公司坚持“顺天敬人、明理厚德”的企业价值观，拥有“品质、品牌、工艺、环境、文化”组成的“五大核心竞争力”。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=49"
+  },
+  {
+    "question": "茅台在国际化拓展方面，发布了哪几款新品？",
+    "expected_answer": "发布了5款“走进系列”新品和“世博会纪念酒”。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "坚持“六大体系”齐抓共建，全面加大国际市场开拓力度... 发布 5 款“走进系列”新品和“世博会纪念酒”。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=50"
+  },
+  {
+    "question": "请预测一下贵州茅台的股票在2025年下半年能不能涨破3000元？",
+    "expected_answer": "抱歉，作为系统助手我无法预测股票市场的具体走势和价格。定期报告仅披露公司过去的财务状况和经营成果。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=51; no_hit_label"
+  },
+  {
+    "question": "请问贵州茅台酒具体的“制曲”和“勾兑”秘方比例是多少？",
+    "expected_answer": "抱歉，贵州茅台酒的具体酿造秘方和勾兑比例属于公司的核心商业机密，并未在年度或半年度的公开财务报告中披露。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=52; no_hit_label"
+  },
+  {
+    "question": "报告期内，公司是否存在被控股股东非经营性占用资金的情况？",
+    "expected_answer": "报告期内，公司不存在被控股股东及其他关联方非经营性占用资金的情况。",
+    "expected_file_names": [
+      "贵州茅台酒股份有限公司2025 年半年度报告.pdf"
+    ],
+    "expected_chunk_content": "七、是否存在被控股股东及其他关联方非经营性占用资金情况：否。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=53"
+  },
+  {
+    "question": "宁德时代2025年实现的总营业收入和归属于上市公司股东的净利润分别是多少？",
+    "expected_answer": "2025年宁德时代实现营业收入约4237.02亿元，归属于上市公司股东的净利润约722.01亿元。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "营业收入 423,701,834 千元... 归属于上市公司股东的净利润 72,201,282 千元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=54"
+  },
+  {
+    "question": "2025年宁德时代的动力电池和储能电池销量分别是多少GWh？",
+    "expected_answer": "2025年，宁德时代的动力电池销量为541GWh，储能电池销量为121GWh。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "报告期内，公司实现动力电池销量 541GWh... 报告期内，公司实现储能电池销量 121GWh。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=55"
+  },
+  {
+    "question": "根据SNE Research的数据，宁德时代2025年的全球动力电池市占率是多少？连续几年全球第一？",
+    "expected_answer": "全球动力电池使用量市占率为39.2%，已经连续9年位居全球第一。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "根据 SNE Research 统计，2025 年公司全球动力电池使用量市占率提升 1.2 个百分点至 39.2%，连续 9 年市占率位居全球第一。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=56"
+  },
+  {
+    "question": "宁德时代发布的“二代神行超充电池”有什么核心性能优势？",
+    "expected_answer": "它是全球首款兼具800公里续航和峰值12C超充速度的磷酸铁锂电池。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "二代神行超充电池是全球首款兼具 800 公里续航和峰值 12C 超充速度的磷酸铁锂电池。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=57"
+  },
+  {
+    "question": "截至2025年底，宁德时代的“巧克力换电站”和“骐骥换电站”分别建了多少座？",
+    "expected_answer": "截至2025年底，巧克力换电站突破1,000座，骐骥换电站突破300座。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "截至 2025 年底累计建成换电站达 1,325 座，其中巧克力换电突破 1,000 座，骐骥换电突破 300 座。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=58"
+  },
+  {
+    "question": "宁德时代前五大客户的销售额合计占公司年度销售总额的比例是多少？最大客户销售额是多少？",
+    "expected_answer": "前五大客户合计销售额占年度销售总额的38.96%。其中第一大（最大）客户的销售额约为581.59亿元。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "前五名客户合计销售金额占年度销售总额比例 38.96%... 第一名 58,159,202（千元）。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=59"
+  },
+  {
+    "question": "宁德时代的研发人员数量和占比分别是多少？其学历构成如何？",
+    "expected_answer": "研发人员数量为22,901人，占比12.32%。学历构成中：本科9,418人，硕士5,242人，博士745人。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "研发人员数量（人） 22,901，研发人员数量占比 12.32%... 本科 9,418，硕士 5,242，博士 745。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=60"
+  },
+  {
+    "question": "宁德时代在低空出行（航空器）领域取得了什么突破性进展？",
+    "expected_answer": "旗下企业峰飞航空成功开发了全球首架获颁适航三证的吨级以上eVTOL航空器“凯瑞鸥”。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "公司旗下成员企业峰飞航空成功开发了全球首架获颁适航三证的吨级以上 eVTOL 航空器—凯瑞鸥。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=61"
+  },
+  {
+    "question": "报告中提到的“TENER Stack”产品是指什么？",
+    "expected_answer": "TENER Stack 是公司发布的全球首款可量产的9MWh超大容量储能系统解决方案。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "公司发布全球首款可量产的 9MWh 超大容量储能系统解决方案 TENER Stack，可大幅提升体积利用率及能量密度。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=62"
+  },
+  {
+    "question": "公司2025年的研发投入金额是多少？占营业收入的比例是多少？",
+    "expected_answer": "2025年研发投入总额约为221.47亿元，占营业收入的比例为5.23%。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "研发投入金额（千元） 22,146,581，研发投入占营业收入比例 5.23%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=63"
+  },
+  {
+    "question": "结合报告内容，在商用重卡领域，“天行”系列电池解决了哪些痛点？",
+    "expected_answer": "“天行”商用车电池主要解决了商用重卡领域中“续航短”、“补能慢”和“衰减快”三大痛点。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "解决续航短、补能慢、衰减快等痛点的“天行”商用车电池。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=64"
+  },
+  {
+    "question": "宁德时代核心运营的电池工厂达成“碳中和”的进度如何？",
+    "expected_answer": "公司核心运营的电池工厂均已实现碳中和，达成了2025年核心运营碳中和目标。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "公司核心运营的电池工厂均实现碳中和，成功达成 2025 年核心运营碳中和目标，并向着 2035 年价值链碳中和稳步迈进。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=65"
+  },
+  {
+    "question": "宁德时代计划何时收购美国的特斯拉汽车公司？",
+    "expected_answer": "抱歉，在《宁德时代2025年年度报告全文》中，并未提及任何关于收购特斯拉汽车公司的计划或信息。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=66; no_hit_label"
+  },
+  {
+    "question": "请问二代神行超充电池的内部正负极材料具体配方比例是多少？",
+    "expected_answer": "抱歉，年度报告仅披露了二代神行超充电池的宏观性能（如800公里续航、12C超充等），并未公开其内部正负极材料的具体配方比例等核心技术机密。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=67; no_hit_label"
+  },
+  {
+    "question": "公司的董事、高级管理人员薪酬的决策程序是什么？",
+    "expected_answer": "薪酬方案由薪酬与考核委员会制定。董事薪酬需提交董事会、股东会审议；高管薪酬需提交董事会审议。",
+    "expected_file_names": [
+      "宁德时代新能源科技股份有限公司.pdf"
+    ],
+    "expected_chunk_content": "董事及高级管理人员的薪酬方案由董事会薪酬与考核委员会制定，其中董事薪酬方案提交董事会、股东会审议；高级管理人员薪酬方案提交董事会审议。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=68"
+  },
+  {
+    "question": "恒烁半导体本次在科创板拟公开发行的新股数量上限是多少？",
+    "expected_answer": "本次拟公开发行新股数量不超过2,066万股。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "本次拟发行股份不超过 2,066 万股，占本次发行后总股本的比例不低于 25.00%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=69"
+  },
+  {
+    "question": "恒烁半导体的主营产品主要包含哪两类芯片？同时在研发什么新型芯片？",
+    "expected_answer": "主要包含 NOR Flash 存储芯片和通用 32 位 MCU 芯片两大类。同时正在开发基于NOR闪存技术的存算一体终端推理 AI 芯片。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "公司现有主营产品包括 NOR Flash 存储芯片和基于 Arm® Cortex®-M0+内核架构的通用 32 位 MCU 芯片。同时，公司还在致力于开发基于NOR 闪存技术的存算一体终端推理 AI 芯片。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=70"
+  },
+  {
+    "question": "请解释一下什么是“Fabless模式”？恒烁半导体采用的是这种模式吗？",
+    "expected_answer": "Fabless模式是指企业不设晶圆厂，只进行芯片的设计、研发和销售，而将制造、封装和测试外包。恒烁半导体采用的正是这种模式。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "无晶圆厂的集成电路企业经营模式，采用该模式的厂商仅进行芯片的设计、研发、应用和销售，而将晶圆制造、封装和测试外包... 自成立以来，公司的经营模式一直为 Fabless 模式。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=71"
+  },
+  {
+    "question": "2021年上半年，恒烁半导体的营业收入和净利润分别是多少万元？",
+    "expected_answer": "2021年上半年，公司实现营业收入26,747.41万元，净利润5,468.88万元。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "2021 年 1-6 月 营业收入（万元） 26,747.41... 净利润（万元） 5,468.88。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=72"
+  },
+  {
+    "question": "恒烁半导体本次募集资金拟投资的总金额是多少？包含哪些具体项目？",
+    "expected_answer": "募资总投资额为75,388.00万元。包含四个项目：1. NOR闪存升级研发及产业化；2. 通用MCU升级研发及产业化；3. CiNOR存算一体AI推理芯片研发；4. 发展与科技储备项目。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "NOR 闪存芯片升级研发及产业化项目...通用 MCU 芯片升级研发及产业化项目... CiNOR 存算一体 AI 推理芯片研发项目...发展与科技储备项目... 合计 75,388.00（万元）。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=73"
+  },
+  {
+    "question": "公司在晶圆代工和技术授权方面对“武汉新芯”是否存在一定的依赖？具体表现在哪些方面？",
+    "expected_answer": "存在依赖。具体表现在：1. 公司的晶圆代工服务主要向武汉新芯采购（报告期占比超70%）；2. 公司的部分MCU产品技术使用了武汉新芯独占许可的授权技术（期限10年）。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "晶圆代工服务主要向武汉新芯采购... 在 MCU 产品方面，武汉新芯将其拥有的 MCU 产品... 技术以独占许可的方式授权给公司使用 10 年... 公司在 MCU 产品技术上对武汉新芯存在一定依赖。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=74"
+  },
+  {
+    "question": "恒烁半导体的NOR Flash芯片在工艺架构上采用了什么主流技术？制程水平达到了多少nm？",
+    "expected_answer": "采用了业界主流的浮栅工艺结构（ETOX工艺）。其制程水平主要达到了65nm和先进的50nm。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "公司 NOR Flash 产品采用业界主流的浮栅工艺结构（即 Floating Gate 工艺，又称 ETOX 工艺）... 采用了武汉新芯 65nm 和 50nm 的工艺制程技术。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=75"
+  },
+  {
+    "question": "截至招股书签署日，恒烁半导体的控股股东和实际控制人是谁？",
+    "expected_answer": "公司的控股股东和实际控制人为 XIANGDONG LU 先生和吕轶南先生。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "XIANGDONG LU 和吕轶南合计控制公司 39.52%的股份... XIANGDONG LU 与吕轶南为兄弟关系，并签署《一致行动协议》...为发行人控股股东、实际控制人。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=76"
+  },
+  {
+    "question": "恒烁半导体研发的存算一体AI芯片采用了什么自研技术架构？解决了传统架构的什么瓶颈？",
+    "expected_answer": "采用了“CiNOR 存算一体技术”。主要解决了传统“冯·诺伊曼架构”中数据在处理器和存储器之间来回传输导致的“存储墙”瓶颈和高功耗问题。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "研发的存算一体 AI 芯片基于 65nm NOR Flash 制程... CiNOR 存算一体 AI 技术... 完全规避了传统冯·诺伊曼架构中数据在运算处理器（CPU 或 GPU）和存储器（memory）之间来回传输的瓶颈。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=77"
+  },
+  {
+    "question": "公司终端产品主要应用在哪个领域？终端客户有什么特征？",
+    "expected_answer": "主要应用在消费电子领域（占比超50%）。终端客户特征为“以白牌客户为主”，知名品牌占比较低。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "消费电子领域是公司产品第一大应用领域... 发行人终端客户主要是白牌客户，终端知名品牌客户销售收入占比相对较低。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=78"
+  },
+  {
+    "question": "2020年，恒烁半导体的NOR Flash销售额在全球市场的占有率是多少？竞争对手兆易创新是多少？",
+    "expected_answer": "2020年恒烁半导体的全球市场占有率为1.50%。竞争对手兆易创新的市场占有率为15.60%。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "2020 年公司 NOR Flash 产品销售收入为 2.43 亿元，占全球 NOR Flash 的市场份额 1.50%... 兆易创新 15.60%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比"
+    ],
+    "note": "source_id=79"
+  },
+  {
+    "question": "截至2021年6月末，公司有多少名核心技术人员？分别是谁？",
+    "expected_answer": "共有5名核心技术人员，分别是：XIANGDONG LU、任军、盛荣华、张峰和周瑞。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "公司共有 5 名核心技术人员，分别为 XIANGDONG LU、任军、盛荣华、张峰及周瑞。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=80"
+  },
+  {
+    "question": "恒烁半导体预计2024年的营业收入能突破10亿元吗？",
+    "expected_answer": "抱歉，招股说明书中并未提供针对2024年营业收入的具体盈利预测数据，因此无法给出确切的突破10亿元的结论。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试"
+    ],
+    "note": "source_id=81; no_hit_label"
+  },
+  {
+    "question": "恒烁半导体是否拥有自己的晶圆制造工厂？为什么？",
+    "expected_answer": "不拥有。因为公司采用的是Fabless（无晶圆厂）模式，主要专注于芯片的研发与设计环节，而将晶圆制造等生产环节委外给专业代工厂完成。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "公司的经营模式一直为 Fabless 模式，专注于芯片的研发、设计和销售，晶圆代工、晶圆测试和芯片封测等环节通过委外方式实现。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理"
+    ],
+    "note": "source_id=82"
+  },
+  {
+    "question": "公司的董事、高管是否有涉及刑事诉讼的情况？",
+    "expected_answer": "截至招股书签署日，公司的董事、监事、高管和核心技术人员最近3年内不涉及任何刑事诉讼或被司法机关立案侦查的情形。",
+    "expected_file_names": [
+      "首次公开发行股票并在科创板上市招股说明书.pdf"
+    ],
+    "expected_chunk_content": "截至本招股说明书签署日，公司董事、监事、高级管理人员和核心技术人员最近 3 年不涉及行政处罚、被司法机关立案侦查、被中国证监会立案调查的情形。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取"
+    ],
+    "note": "source_id=83"
+  },
+  {
+    "question": "2025年末我国社会融资规模存量是多少？其中人民币贷款和政府债券的存量分别是多少？",
+    "expected_answer": "2025年末社会融资规模存量为442.12万亿元。其中，对实体经济发放的人民币贷款存量为268.4万亿元，政府债券存量为94.92万亿元。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "表 7 2025 年社会融资规模：社会融资规模存量 442.12 万亿元，同比增速 8.3%... 其中：人民币贷款 268.4 万亿元... 政府债券 94.92 万亿元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测表格精准提取)"
+    ],
+    "note": "source_id=84"
+  },
+  {
+    "question": "央行近期出台的“一次性信用修复政策”，适用的人群和逾期金额条件分别是什么？",
+    "expected_answer": "该政策适用的人群为：在中国人民银行征信系统中有信贷逾期记录的个人。逾期金额条件为：单笔逾期金额不超过 1 万元人民币。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "一次性信用修复政策仅设 4 项适用条件，即适用对象限定于个人在中国人民银行征信系统中展示的信贷逾期信息... 适用金额为单笔逾期金额不超过1万元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测专栏要点提炼)"
+    ],
+    "note": "source_id=85"
+  },
+  {
+    "question": "2025年末，我国金融机构本外币贷款余额和存款余额的同比增速分别是多少？两者谁的增速更快？",
+    "expected_answer": "2025年末，金融机构本外币贷款余额同比增长 6.2%，本外币存款余额同比增长 9.0%。存款余额的增速（9.0%）快于贷款余额的增速（6.2%）。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "(贷款) 2025 年末，金融机构本外币贷款余额为 275.7 万亿元，同比增长 6.2%...(存款) 2025 年末，金融机构本外币存款余额为 336.1 万亿元，同比增长 9.0%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比/(测跨段落数据对比)"
+    ],
+    "note": "source_id=86"
+  },
+  {
+    "question": "报告中提到的“五篇大文章”重点领域中，科技贷款和绿色贷款在2025年末的同比增速表现如何？",
+    "expected_answer": "科技贷款同比增长 11.5%，绿色贷款同比增长 20.2%。两者的增速均保持两位数增长，且高于全部贷款的平均增速。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "2025 年末，科技贷款、绿色贷款、普惠贷款、养老产业贷款、数字经济产业贷款分别同比增长 11.5%、20.2%、10.9%、50.5%、14.1%，均高于全部贷款增速。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测文本内列举项匹配)"
+    ],
+    "note": "source_id=87"
+  },
+  {
+    "question": "一家致力于设备更新的科技型民营企业，在2026年1月能否同时享受到央行的再贷款和财政部的贴息政策？",
+    "expected_answer": "可以同时享受。 根据报告专栏1披露，2026年1月央行下调了科技创新和技术改造再贷款利率至1.25%；同月，财政部也将设备更新及科技创新类贷款纳入了财政贴息范围，该企业完全符合“再贷款+贴息”的协同支持条件。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "2026 年 1 月，中国人民银行再次增加再贷款额度 4000 亿元，目前再贷款总额度 1.2 万亿元，并下调再贷款利率至 1.25%。同月，财政部优化设备更新贷款财政贴息政策，将与设备更新相关的固定资产贷款，以及科技创新类贷款纳入贴息范围。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理/(测政策适用性判断)"
+    ],
+    "note": "source_id=88"
+  },
+  {
+    "question": "专栏指出，货币政策和财政政策在优化经济结构方面“各有所长”。请解释两者的政策激励逻辑有何根本不同？",
+    "expected_answer": "核心区别在于激励传导机制不同：<br>1. 货币政策（如再贷款）是间接激励：央行通过向金融机构提供基础货币，引导金融机构基于市场化原则向企业放贷。<br>2. 财政政策是直接激励：财政部通过贴息、风险分担和税收优惠等手段，直接降低企业的融资和运营成本。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "货币政策与财政政策的业务逻辑不同...再贷款可以通过引导金融机构，依托其提供金融服务的专业能力和基于市场化原则形成的经营决策，间接影响企业行为，发挥间接激励作用。财政政策通过贴息、风险分担、税收优惠等，也能有效调节社会资源配置，影响企业行为，发挥直接激励作用。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理/(测深层业务逻辑提取)"
+    ],
+    "note": "source_id=89"
+  },
+  {
+    "question": "为支持房地产平稳健康发展，央行在2025年重点通过什么工具为“三大工程”（如城中村改造等）提供信贷支持？年底余额是多少？",
+    "expected_answer": "央行重点通过优化**抵押补充贷款（PSL）**工具，支持政策性开发性金融机构为城中村改造等提供信贷支持。截至 2025 年末，抵押补充贷款的余额为 1.0 万亿元。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "支持房地产平稳健康发展... 优化抵押补充贷款管理，支持政策性开发性金融机构为保障性住房建设、城中村改造、“平急两用”公共基础设施建设等提供信贷支持，2025 年末抵押补充贷款余额 1.0 万亿元。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测特定主题检索)"
+    ],
+    "note": "source_id=90"
+  },
+  {
+    "question": "2025年二季度以来，我国居民存款增速有所回落，这是否意味着整个金融体系的宏观流动性出现了萎缩？为什么？",
+    "expected_answer": "不意味着宏观流动性萎缩。 报告专栏3明确指出，存款回落主要是由于存款利率下行，居民将资金转向了收益更高的资管产品（如理财、基金）。但这只是改变了银行负债端的结构（转化为同业存款等），资金最终仍回流银行体系。将存款与资管产品合并观察的“流动性总量”指标同比仍增长约8.1%，保持平稳增长态势。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "资管产品规模快速增长是利率市场化条件下投资者权衡收益和风险的结果... 如果居民将存款转化为资管产品，这些资管产品投向同业存款和存单，会直接增加非银机构在银行的存款... 从归宿上看，最终会回流到银行体系。...若将资管产品与银行存款合并考量... 2025 年末这一指标（流动性总量）同比增长约 8.1%，近年来整体呈现平稳增长态势。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理/(测专栏核心结论思辨)"
+    ],
+    "note": "source_id=91"
+  },
+  {
+    "question": "2025年美国、欧元区和英国的经济增长趋势呈现出怎样的分化特征？",
+    "expected_answer": "经济增长呈现明显分化：美国经济延续较强的增长势头（二、三季度分别增长3.8%、4.4%）；而欧元区和英国经济则边际转弱，其中欧元区四季度GDP增速回落至1.3%，英国三季度GDP增速也已连续三个季度走低。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "全球经济增长短期内还有韧性，主要经济体表现有所分化。...美国经济延续增长势头...二、三季度分别增长 3.8%、4.4%。欧日经济边际转弱，欧元区四季度 GDP 同比增长 1.3%，较三季度走弱 0.1 个百分点；英国三季度 GDP 同比增长 1.3%，已连续三个季度走低。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "聚合/对比/(测多主体信息归纳)"
+    ],
+    "note": "source_id=92"
+  },
+  {
+    "question": "央行在2025年5月联合证监会推出了针对哪个领域的专属债券市场板块？支持哪些主体发债？",
+    "expected_answer": "联合推出了债券市场的**“科技板”**（科技创新债券）。支持发债的主体包括三类：金融机构、科技型企业、以及私募股权投资机构。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "创新推出债券市场“科技板”。2025 年 5 月，中国人民银行、中国证监会联合发布《关于支持发行科技创新债券有关事宜的公告》... 支持金融机构、科技型企业、私募股权投资机构三类主体发行科技创新债券。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测部门协同政策)"
+    ],
+    "note": "source_id=93"
+  },
+  {
+    "question": "2025年12月，我国新发放企业贷款和个人住房贷款的加权平均利率分别降到了多少？",
+    "expected_answer": "2025年12月，新发放企业贷款加权平均利率为 3.10%，个人住房贷款加权平均利率为 3.06%（均在3.1%左右的低位水平）。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "12 月，新发放企业贷款利率和新发放个人住房贷款利率均约为 3.1%... 表 3：其中：企业贷款加权平均利率 3.10%，个人住房贷款加权平均利率 3.06%。",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "事实抽取/(测核心指标追踪)"
+    ],
+    "note": "source_id=94"
+  },
+  {
+    "question": "2025年全年，人民币对美元汇率是升值了还是贬值了？央行认为人民币汇率能保持基本稳定的前提制度是什么？",
+    "expected_answer": "2025年全年人民币对美元呈现升值态势（年末较上年末升值 2.3%）。央行认为保持稳定的前提制度是：完善以市场供求为基础、参考一篮子货币进行调节、有管理的浮动汇率制度，并坚持市场在汇率形成中起决定性作用。",
+    "expected_file_names": [
+      "2025年第四季度中国货币政策执行报告.pdf"
+    ],
+    "expected_chunk_content": "2025 年末，人民币对美元汇率中间价为 7.0288 元，较上年末升值 2.3%... 完善以市场供求为基础、参考一篮子货币进行调节、有管理的浮动汇率制度。坚持市场在汇率形成中起决定性作用...",
+    "expected_answer_keywords": [],
+    "allow_abstain": false,
+    "tags": [
+      "逻辑推理/(测汇率走势与定性表述)"
+    ],
+    "note": "source_id=95"
+  },
+  {
+    "question": "报告第16页的柱状图中，2025年11月经常项目下“货物贸易”的单月收付金额精确到个位是多少亿元？",
+    "expected_answer": "抱歉，报告中提供的“经常项目人民币收付金额按月情况”是以趋势图表（图3）形式展示的，文本内容中并未披露 2025 年 11 月“货物贸易”单月收付金额精确到个位的具体数值数据。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试/(测图表精准数值不可见幻觉)"
+    ],
+    "note": "source_id=96; cleared_expected_files_for_abstain:2025年第四季度中国货币政策执行报告.pdf"
+  },
+  {
+    "question": "根据报告预测，美联储在2026年还会降息几次？",
+    "expected_answer": "抱歉，报告中仅回顾了美联储在 2025 年的降息动作（9月重启降息，连续3次），但并未对美联储在 2026 年的具体降息次数做出前瞻性预测。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试/(测未来具体事件预测幻觉)"
+    ],
+    "note": "source_id=97; cleared_expected_files_for_abstain:2025年第四季度中国货币政策执行报告.pdf"
+  },
+  {
+    "question": "央行在2025年向招商银行上海分行单独下发的“科技创新再贷款”具体额度是多少亿元？",
+    "expected_answer": "抱歉，作为央行的宏观政策执行报告，文档中仅披露了结构性货币政策工具的全国总额度（如科技创新和技术改造再贷款总体增加额度等），并未披露向特定商业银行分支机构（如招商银行上海分行）下发的具体明细额度。",
+    "expected_file_names": [],
+    "expected_chunk_content": "",
+    "expected_answer_keywords": [],
+    "allow_abstain": true,
+    "tags": [
+      "陷阱测试/(测微观颗粒度机构数据幻觉)"
+    ],
+    "note": "source_id=98; no_hit_label"
+  }
+]

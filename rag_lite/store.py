@@ -154,33 +154,9 @@ class ExperimentStore:
                 )
                 """
             )
-            try:
-                conn.execute("ALTER TABLE qa_log ADD COLUMN session_id INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE qa_log ADD COLUMN diagnostics_json TEXT")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE eval_cases ADD COLUMN expected_chunk_content TEXT")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE eval_case_results ADD COLUMN chunk_hit INTEGER")
-            except sqlite3.OperationalError:
-                pass
-            for sql in (
-                "ALTER TABLE index_manifest ADD COLUMN build_id TEXT",
-                "ALTER TABLE index_manifest ADD COLUMN active_chroma_subdir TEXT",
-                "ALTER TABLE index_manifest ADD COLUMN activated_at TEXT",
-                "ALTER TABLE index_manifest ADD COLUMN readiness_json TEXT",
-            ):
-                try:
-                    conn.execute(sql)
-                except sqlite3.OperationalError:
-                    pass
-            conn.commit()
+            # Schema migrations are now versioned. See _apply_migrations below.
+            self._create_migrations_table(conn)
+            self._apply_migrations(conn)
 
     def log_upload(self, saved_path: str, original_name: str, size_bytes: int) -> None:
         with self._connect() as conn:
@@ -247,12 +223,17 @@ class ExperimentStore:
             )
             conn.commit()
 
-    def fetch_all_qa(self) -> list[dict[str, Any]]:
+    def fetch_all_qa(self, *, include_eval: bool = True) -> list[dict[str, Any]]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, created_at, question, answer, sources_json, params_json, diagnostics_json, rating, note, session_id FROM qa_log ORDER BY id ASC"
-            ).fetchall()
+            sql = (
+                "SELECT id, created_at, question, answer, sources_json, params_json, diagnostics_json, rating, note, session_id "
+                "FROM qa_log"
+            )
+            if not include_eval:
+                sql += " WHERE session_id IS NOT NULL"
+            sql += " ORDER BY id ASC"
+            rows = conn.execute(sql).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(
@@ -271,12 +252,12 @@ class ExperimentStore:
             )
         return out
 
-    def export_json(self, dest: Path) -> None:
-        data = self.fetch_all_qa()
+    def export_json(self, dest: Path, *, include_eval: bool = True) -> None:
+        data = self.fetch_all_qa(include_eval=include_eval)
         dest.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def export_csv(self, dest: Path) -> None:
-        rows = self.fetch_all_qa()
+    def export_csv(self, dest: Path, *, include_eval: bool = True) -> None:
+        rows = self.fetch_all_qa(include_eval=include_eval)
         if not rows:
             dest.write_text("", encoding="utf-8")
             return
@@ -416,34 +397,23 @@ class ExperimentStore:
                 (name,),
             ).fetchone()
             if old is not None:
-                dataset_id = int(old["id"])
-                run_rows = conn.execute(
-                    "SELECT id FROM eval_runs WHERE dataset_id = ?",
-                    (dataset_id,),
-                ).fetchall()
-                run_ids = [int(r[0]) for r in run_rows]
-                if run_ids:
-                    qmarks = ",".join("?" for _ in run_ids)
-                    conn.execute(f"DELETE FROM eval_case_results WHERE run_id IN ({qmarks})", run_ids)
-                conn.execute("DELETE FROM eval_runs WHERE dataset_id = ?", (dataset_id,))
-                conn.execute("DELETE FROM eval_cases WHERE dataset_id = ?", (dataset_id,))
-                conn.execute(
-                    """
-                    UPDATE eval_datasets
-                    SET description = ?, updated_at = ?, case_count = ?
-                    WHERE id = ?
-                    """,
-                    (description, now, len(cases), dataset_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    INSERT INTO eval_datasets (name, description, created_at, updated_at, case_count)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (name, description, now, now, len(cases)),
-                )
-                dataset_id = int(cur.lastrowid)
+                base = name
+                suffix = now.replace(":", "").replace("-", "").replace("T", "_").replace("Z", "")
+                name = f"{base} @ {suffix}"
+                counter = 2
+                while conn.execute("SELECT 1 FROM eval_datasets WHERE name = ?", (name,)).fetchone() is not None:
+                    name = f"{base} @ {suffix}-{counter}"
+                    counter += 1
+                version_note = f"Imported as a new dataset version because '{base}' already exists."
+                description = f"{description}\n{version_note}" if description else version_note
+            cur = conn.execute(
+                """
+                INSERT INTO eval_datasets (name, description, created_at, updated_at, case_count)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (name, description, now, now, len(cases)),
+            )
+            dataset_id = int(cur.lastrowid)
 
             for idx, case in enumerate(cases, start=1):
                 conn.execute(
@@ -542,6 +512,28 @@ class ExperimentStore:
             )
             conn.commit()
             return int(cur.lastrowid)
+
+    def patch_eval_run_params(self, run_id: int, patch: dict[str, Any]) -> dict[str, Any]:
+        """Merge keys into an existing RUN params_json and return the merged dict."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT params_json FROM eval_runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+            raw = row[0] if row else "{}"
+            try:
+                params = json.loads(raw or "{}")
+            except Exception:
+                params = {}
+            if not isinstance(params, dict):
+                params = {}
+            params.update(dict(patch or {}))
+            conn.execute(
+                "UPDATE eval_runs SET params_json = ? WHERE id = ?",
+                (json.dumps(params, ensure_ascii=False), int(run_id)),
+            )
+            conn.commit()
+            return params
 
     def save_eval_case_result(
         self,
@@ -727,3 +719,89 @@ class ExperimentStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM index_manifest WHERE id = 1")
             conn.commit()
+
+    # --- Schema migrations ---
+
+    def _create_migrations_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+
+    def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+        """Apply any unapplied schema migrations.
+
+        Migrations are append-only and forward-only. Each migration knows how
+        to detect whether it was already applied in a pre-framework database
+        (column-existence check for ALTER TABLE migrations), so this is safe
+        to enable on an existing DB: if the column already exists, we just
+        record the version as applied without re-running.
+        """
+        migrations: list[tuple[int, str, list[str], "Callable[[sqlite3.Connection], bool]"]] = [
+            (1, "qa_log.add_session_id",
+             ["ALTER TABLE qa_log ADD COLUMN session_id INTEGER"],
+             lambda c: self._has_column(c, "qa_log", "session_id")),
+            (2, "qa_log.add_diagnostics_json",
+             ["ALTER TABLE qa_log ADD COLUMN diagnostics_json TEXT"],
+             lambda c: self._has_column(c, "qa_log", "diagnostics_json")),
+            (3, "eval_cases.add_expected_chunk_content",
+             ["ALTER TABLE eval_cases ADD COLUMN expected_chunk_content TEXT"],
+             lambda c: self._has_column(c, "eval_cases", "expected_chunk_content")),
+            (4, "eval_case_results.add_chunk_hit",
+             ["ALTER TABLE eval_case_results ADD COLUMN chunk_hit INTEGER"],
+             lambda c: self._has_column(c, "eval_case_results", "chunk_hit")),
+            (5, "index_manifest.add_build_id",
+             ["ALTER TABLE index_manifest ADD COLUMN build_id TEXT"],
+             lambda c: self._has_column(c, "index_manifest", "build_id")),
+            (6, "index_manifest.add_active_chroma_subdir",
+             ["ALTER TABLE index_manifest ADD COLUMN active_chroma_subdir TEXT"],
+             lambda c: self._has_column(c, "index_manifest", "active_chroma_subdir")),
+            (7, "index_manifest.add_activated_at",
+             ["ALTER TABLE index_manifest ADD COLUMN activated_at TEXT"],
+             lambda c: self._has_column(c, "index_manifest", "activated_at")),
+            (8, "index_manifest.add_readiness_json",
+             ["ALTER TABLE index_manifest ADD COLUMN readiness_json TEXT"],
+             lambda c: self._has_column(c, "index_manifest", "readiness_json")),
+        ]
+        applied_rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
+        applied_versions = {int(r[0]) for r in applied_rows}
+        for version, name, sqls, already_check in migrations:
+            if version in applied_versions:
+                continue
+            try:
+                already_applied = bool(already_check(conn))
+            except sqlite3.OperationalError:
+                already_applied = False
+            if already_applied:
+                # Pre-framework DB: column already present. Just record the version.
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?,?,?)",
+                    (version, name, _utc_now()),
+                )
+                continue
+            for sql in sqls:
+                conn.execute(sql)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?,?,?)",
+                (version, name, _utc_now()),
+            )
+        conn.commit()
+
+    def list_applied_migrations(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+

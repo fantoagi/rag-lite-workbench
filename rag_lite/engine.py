@@ -16,6 +16,14 @@ from llama_index.llms.ollama import Ollama
 
 from rag_lite.config import AppConfig
 from rag_lite.ingest import chunk_diagnostics, load_index_from_disk, resolve_active_chroma_dir, uploaded_files_snapshot
+from rag_lite.eval_platform import attach_run_fingerprint
+from rag_lite.retrieval import (
+    RetrievalPipelineResult,
+    clear_keyword_cache,
+    keyword_retrieve,
+    merge_retrieval_candidates,
+    retrieval_mode_label,
+)
 from rag_lite.rerank import rerank_nodes
 from rag_lite.store import ExperimentStore
 
@@ -70,11 +78,9 @@ def _ollama_llm_sdk_client(o: dict[str, Any]) -> OllamaSdkClient:
 
 
 def _ollama_embed_client_kwargs(o: dict[str, Any]) -> dict[str, Any]:
-    base = str(o.get("base_url") or "http://127.0.0.1:11434")
     read_sec = float(o.get("request_timeout", 600.0))
     conn_sec = float(o.get("connect_timeout", 60.0))
     return {
-        "host": base,
         "timeout": httpx.Timeout(
             connect=conn_sec,
             read=read_sec,
@@ -113,6 +119,7 @@ def _is_transient_ollama_embed_error(exc: Exception) -> bool:
             "connection reset",
             "forcibly closed",
             "remote protocol error",
+            "failed to connect to ollama",
             "readerror",
             "connecterror",
         )):
@@ -137,6 +144,7 @@ def _vector_retrieve_once(index, query: str, top_n: int):
 def clear_all_index_caches() -> None:
     global _index_cache
     _index_cache.clear()
+    clear_keyword_cache()
     try:
         import gc
 
@@ -177,18 +185,24 @@ def node_to_source_dict(nws, score_kind: str) -> dict[str, Any]:
     file_name = _node_file_name(nws)
     node = nws.node
     text = node.get_content(metadata_mode="none")
-    preview = text if len(text) <= 2000 else text[:2000] + "\n…"
+    preview = text if len(text) <= 2000 else text[:2000] + "\n..."
     score = nws.score
     md_now = node.metadata
     vec_raw = md_now.get("rag_vector_score") if isinstance(md_now, dict) else None
+    keyword_raw = md_now.get("rag_keyword_score") if isinstance(md_now, dict) else None
+    merged_raw = md_now.get("rag_merged_score") if isinstance(md_now, dict) else None
+    retrieval_sources = md_now.get("rag_retrieval_sources") if isinstance(md_now, dict) else None
     return {
+        "node_id": str(getattr(node, "node_id", "") or getattr(node, "id_", "") or ""),
         "file_name": file_name,
         "chunk": preview,
         "score": float(score) if score is not None else None,
         "score_kind": score_kind,
         "vector_score": float(vec_raw) if vec_raw is not None else None,
+        "keyword_score": float(keyword_raw) if keyword_raw is not None else None,
+        "merged_score": float(merged_raw) if merged_raw is not None else None,
+        "retrieval_sources": list(retrieval_sources) if isinstance(retrieval_sources, list) else [],
     }
-
 
 def nodes_to_source_dicts(nodes, score_kind: str) -> list[dict[str, Any]]:
     return [node_to_source_dict(n, score_kind) for n in nodes]
@@ -213,13 +227,22 @@ def select_nodes_for_answer(
     llm_num_ctx: int | None = None,
 ) -> tuple[list, bool]:
     """
-    根据 max_llm_context_chars 选择可完整放入上下文的节点集合，避免
-    「引用来源展示」与「模型实际看到的上下文」不一致。
+    选择实际喂给 LLM 的节点：先按 answer_top_k（生成侧上限）截断，
+    再按 max_llm_context_chars 做字符预算，避免引用展示与模型所见不一致。
     返回 (selected_nodes, truncated)。
     """
     nodes_list = list(nodes or [])
     if not nodes_list:
         return [], False
+    # 生成侧 Top-K：默认可低于检索 top_k，减轻小模型串文档
+    try:
+        answer_top_k = int((cfg.retrieval or {}).get("answer_top_k") or 0)
+    except (TypeError, ValueError):
+        answer_top_k = 0
+    capped_by_k = False
+    if answer_top_k > 0 and len(nodes_list) > answer_top_k:
+        nodes_list = nodes_list[:answer_top_k]
+        capped_by_k = True
     o = dict(cfg.ollama)
     if llm_model:
         o["llm_model"] = llm_model
@@ -230,7 +253,7 @@ def select_nodes_for_answer(
     fixed_len = len("【已知上下文】\n") + len("\n\n【用户问题】\n") + len(q)
     budget = max_c - fixed_len
     if budget <= 0:
-        return [], bool(nodes_list)
+        return [], True
     selected: list = []
     used = 0
     sep_len = len("\n\n---\n\n")
@@ -241,7 +264,8 @@ def select_nodes_for_answer(
             break
         selected.append(nws)
         used += add
-    return selected, (len(selected) < len(nodes_list))
+    truncated = capped_by_k or (len(selected) < len(nodes or []))
+    return selected, truncated
 
 
 def filter_nodes_by_excluded_files(nodes: list, excluded_files: list[str] | tuple[str, ...] | None) -> tuple[list, int]:
@@ -396,6 +420,76 @@ def retrieve(
     return apply_topk_rerank(cfg, query, nodes, top_k, use_rerank)
 
 
+def hybrid_retrieve(
+    cfg: AppConfig,
+    index,
+    query: str,
+    top_n: int,
+    top_k: int,
+    use_rerank: bool,
+    excluded_files: list[str] | tuple[str, ...] | None = None,
+    *,
+    keyword_top_n: int | None = None,
+    vector_enabled: bool = True,
+    keyword_enabled: bool = True,
+) -> RetrievalPipelineResult:
+    """Vector + local BM25 retrieval, de-duplicated before optional rerank."""
+    top_n = max(1, int(top_n))
+    top_k = max(1, int(top_k))
+    keyword_n = max(1, int(keyword_top_n or top_n))
+    vector_error = ""
+    if vector_enabled:
+        try:
+            vector_nodes = vector_retrieve(cfg, index, query, top_n)
+        except Exception as exc:
+            vector_error = f"{type(exc).__name__}: {exc}"
+            vector_nodes = []
+    else:
+        vector_error = "vector retrieval skipped"
+        vector_nodes = []
+    vector_nodes_filtered, excluded_count = filter_nodes_by_excluded_files(vector_nodes, excluded_files)
+    if keyword_enabled:
+        keyword_nodes = keyword_retrieve(
+            cfg,
+            index,
+            query,
+            keyword_n,
+            excluded_files=excluded_files,
+        )
+    else:
+        keyword_nodes = []
+    merged_nodes = merge_retrieval_candidates(vector_nodes_filtered, keyword_nodes)
+    final_nodes, kind = apply_topk_rerank(cfg, query, merged_nodes, top_k, use_rerank)
+    requested_mode = retrieval_mode_label(
+        vector_enabled=bool(vector_enabled),
+        keyword_enabled=bool(keyword_enabled),
+    )
+    vector_failed = bool(
+        vector_enabled
+        and str(vector_error or "").strip()
+        and "skipped" not in str(vector_error or "").lower()
+    )
+    # 向量阶段失败时不得继续标成 hybrid/rerank，避免伪成功
+    if vector_failed:
+        if keyword_enabled and merged_nodes:
+            kind = "keyword_fallback"
+        else:
+            kind = "vector_error"
+    elif kind == "vector":
+        kind = requested_mode
+    return RetrievalPipelineResult(
+        vector_nodes=vector_nodes,
+        keyword_nodes=keyword_nodes,
+        merged_nodes=merged_nodes,
+        final_nodes=final_nodes,
+        score_kind=kind,
+        excluded_candidate_count=excluded_count,
+        vector_error=vector_error,
+        retrieval_degraded=bool(vector_failed),
+        requested_retrieval_mode=requested_mode,
+    )
+
+
 def stream_answer(
     cfg: AppConfig,
     query: str,
@@ -499,6 +593,16 @@ def _safe_active_chroma_label(cfg: AppConfig) -> str | None:
         return str(active_dir)
 
 
+def _norm_path_for_compare(path_text: str | None) -> str:
+    t = str(path_text or "").strip()
+    if not t:
+        return ""
+    t = t.replace("\\", "/")
+    while "//" in t:
+        t = t.replace("//", "/")
+    return t.casefold()
+
+
 def _build_index_snapshot(cfg: AppConfig) -> dict[str, Any]:
     manifest = _safe_manifest(cfg) or {}
     uploads = uploaded_files_snapshot(cfg)
@@ -524,10 +628,12 @@ def _build_index_snapshot(cfg: AppConfig) -> dict[str, Any]:
             if not any(str(x.get("name") or "").strip() == name for x in uploads):
                 uploads_changed = True
                 break
+    active_norm = _norm_path_for_compare(active_label)
+    manifest_norm = _norm_path_for_compare(manifest_active)
     active_matches_manifest = bool(
-        manifest_active
-        and active_label
-        and (active_label == manifest_active or active_label.endswith(manifest_active))
+        manifest_norm
+        and active_norm
+        and (active_norm == manifest_norm or active_norm.endswith(manifest_norm))
     )
     readiness = dict(manifest.get("readiness") or {})
     final_health = dict(readiness.get("final_health") or {}) if isinstance(readiness.get("final_health"), dict) else {}
@@ -538,7 +644,7 @@ def _build_index_snapshot(cfg: AppConfig) -> dict[str, Any]:
     except Exception:
         diag_summary = {}
     missing_uploaded = list(readiness.get("missing_uploaded_files") or final_health.get("missing_uploaded_files") or [])
-    readiness_healthy = bool(readiness.get("ok") or final_health.get("ok"))
+    readiness_healthy = bool((readiness.get("ok") or final_health.get("ok")) and readiness.get("diagnostics_ok", True))
     return {
         "active": {
             "chroma_dir": active_label,
@@ -578,14 +684,94 @@ def _build_index_snapshot(cfg: AppConfig) -> dict[str, Any]:
     }
 
 
+def resolve_index_chunk_params(
+    cfg: AppConfig,
+    ui_chunk_size: int | None = None,
+    ui_chunk_overlap: int | None = None,
+    ui_chunk_mode: str | None = None,
+) -> dict[str, Any]:
+    """以活跃索引 manifest 的切片参数为准；UI 仅作对照。
+
+    检索读的是已构建索引，UI 改 chunk 不会改变召回结果。
+    """
+    index_snapshot = _build_index_snapshot(cfg)
+    manifest = dict(index_snapshot.get("manifest") or {})
+    def _parse_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    ui_mode_raw = str(ui_chunk_mode or "").strip().lower() or None
+    ui_size = _parse_int(ui_chunk_size)
+    ui_overlap = _parse_int(ui_chunk_overlap)
+    # None/<=0 的 size 视为未指定（参数网格占位）；overlap 仅 None 视为未指定
+    ui_size_set = ui_size is not None and ui_size > 0
+    ui_overlap_set = ui_overlap is not None
+    ui_mode_set = bool(ui_mode_raw)
+
+    index_mode = str(manifest.get("chunk_mode") or "").strip().lower() or None
+    index_size_i = _parse_int(manifest.get("chunk_size"))
+    if index_size_i is not None and index_size_i <= 0:
+        index_size_i = None
+    index_overlap_i = _parse_int(manifest.get("chunk_overlap"))
+
+    effective_mode = index_mode or (ui_mode_raw if ui_mode_set else "sentence")
+    if index_size_i is not None:
+        effective_size = int(index_size_i)
+    elif ui_size_set:
+        effective_size = int(ui_size)
+    else:
+        effective_size = 512
+    if index_overlap_i is not None:
+        effective_overlap = int(index_overlap_i)
+    elif ui_overlap_set:
+        effective_overlap = int(ui_overlap)
+    else:
+        effective_overlap = 64
+
+    mismatch = False
+    if index_mode and ui_mode_set and index_mode != ui_mode_raw:
+        mismatch = True
+    if index_size_i is not None and ui_size_set and int(index_size_i) != int(ui_size):
+        mismatch = True
+    if index_overlap_i is not None and ui_overlap_set and int(index_overlap_i) != int(ui_overlap):
+        mismatch = True
+
+    warning = ""
+    if mismatch:
+        warning = (
+            "UI 切分参数与当前索引不一致；本次 RUN 以索引 manifest 为准"
+            f"（index={effective_mode}/{effective_size}/{effective_overlap}，"
+            f"ui={ui_mode_raw}/{ui_size if ui_size_set else '—'}/"
+            f"{ui_overlap if ui_overlap_set else '—'}）。改切片需重建索引。"
+        )
+    return {
+        "chunk_mode": effective_mode,
+        "chunk_size": int(effective_size),
+        "chunk_overlap": int(effective_overlap),
+        "ui_chunk_mode": ui_mode_raw,
+        "ui_chunk_size": ui_size if ui_size_set else None,
+        "ui_chunk_overlap": ui_overlap if ui_overlap_set else None,
+        "index_chunk_mode": index_mode,
+        "index_chunk_size": index_size_i,
+        "index_chunk_overlap": index_overlap_i,
+        "chunk_params_mismatch": bool(mismatch),
+        "chunk_params_warning": warning,
+        "index_snapshot": index_snapshot,
+    }
+
+
 def build_params_snapshot(
     cfg: AppConfig,
-    chunk_size: int,
-    chunk_overlap: int,
+    chunk_size: int | None,
+    chunk_overlap: int | None,
     top_n: int,
     top_k: int,
     use_rerank: bool,
-    chunk_mode: str = "sentence",
+    chunk_mode: str | None = "sentence",
     llm_model: str | None = None,
     embed_model: str | None = None,
     llm_num_ctx: int | None = None,
@@ -594,20 +780,54 @@ def build_params_snapshot(
     include_zero_chunk: bool | None = None,
     query_anchoring_enabled: bool | None = None,
     query_anchoring_source: str | None = None,
+    vector_enabled: bool = True,
+    keyword_enabled: bool = True,
+    generation_mode: str | None = None,
+    prefer_index_chunk_params: bool = True,
+    retrieval_degraded: bool | None = None,
+    vector_error: str | None = None,
 ) -> dict[str, Any]:
     o = cfg.ollama
+    chunk_info = resolve_index_chunk_params(cfg, chunk_size, chunk_overlap, chunk_mode)
+    if prefer_index_chunk_params:
+        eff_size = int(chunk_info["chunk_size"])
+        eff_overlap = int(chunk_info["chunk_overlap"])
+        eff_mode = str(chunk_info["chunk_mode"])
+    else:
+        try:
+            eff_size = int(chunk_size) if chunk_size is not None else 512
+        except (TypeError, ValueError):
+            eff_size = 512
+        try:
+            eff_overlap = int(chunk_overlap) if chunk_overlap is not None else 64
+        except (TypeError, ValueError):
+            eff_overlap = 64
+        eff_mode = str(chunk_mode or "sentence").strip().lower() or "sentence"
     snap: dict[str, Any] = {
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "chunk_mode": chunk_mode,
+        "chunk_size": eff_size,
+        "chunk_overlap": eff_overlap,
+        "chunk_mode": eff_mode,
+        "ui_chunk_size": chunk_info.get("ui_chunk_size"),
+        "ui_chunk_overlap": chunk_info.get("ui_chunk_overlap"),
+        "ui_chunk_mode": chunk_info.get("ui_chunk_mode"),
+        "chunk_params_mismatch": bool(chunk_info.get("chunk_params_mismatch")),
         "top_n": top_n,
         "top_k": top_k,
         "use_rerank": use_rerank,
+        "generation_mode": generation_mode or "llm",
+        "retrieval_mode": retrieval_mode_label(vector_enabled=bool(vector_enabled), keyword_enabled=bool(keyword_enabled)),
+        "keyword_top_n": top_n,
+        "vector_enabled": bool(vector_enabled),
+        "keyword_enabled": bool(keyword_enabled),
         "prompt_version": cfg.prompt.get("version", "v1"),
         "llm_model": llm_model or o.get("llm_model"),
         "embed_model": embed_model or o.get("embed_model"),
         "rerank_model": cfg.rerank.get("model_name") if use_rerank else None,
     }
+    if retrieval_degraded is not None:
+        snap["retrieval_degraded"] = bool(retrieval_degraded)
+    if vector_error is not None:
+        snap["vector_error"] = str(vector_error or "")
     if llm_num_ctx is not None:
         snap["llm_num_ctx"] = int(llm_num_ctx)
     if query_anchoring_enabled is not None:
@@ -623,5 +843,7 @@ def build_params_snapshot(
         snap["excluded_files"] = cleaned
         snap["excluded_file_count"] = len(cleaned)
         snap["excluded_file_preview"] = cleaned[:10]
-    snap["index_snapshot"] = _build_index_snapshot(cfg)
-    return snap
+    snap["index_snapshot"] = chunk_info.get("index_snapshot") or _build_index_snapshot(cfg)
+    if chunk_info.get("chunk_params_warning"):
+        snap["chunk_params_warning"] = chunk_info["chunk_params_warning"]
+    return attach_run_fingerprint(snap)
