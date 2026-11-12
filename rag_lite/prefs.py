@@ -24,4 +24,7 @@ def load_prefs(data_dir: Path) -> dict[str, Any]:
 def save_prefs(data_dir: Path, data: dict[str, Any]) -> None:
     p = prefs_path(data_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)

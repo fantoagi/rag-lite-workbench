@@ -3,10 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
-
-import httpx
 
 
 def eval_run_report_payload(store: Any, run_id: int) -> dict[str, Any]:
@@ -79,6 +78,7 @@ _ERROR_REASON_ZH: dict[str, str] = {
     "TOPK_DROP": "应命中文档在 Top-K 截断中被丢掉",
     "RERANK_DROP": "应命中文档在重排后被丢掉",
     "CONTEXT_BUDGET_DROP": "应命中文档因上下文长度预算被丢掉",
+    "ANSWER_TOPK_DROP": "应命中文档在生成侧 answer_top_k 之外，未送入模型",
     "FILTERED_OUT": "应命中文档被排除规则过滤",
     "EXPECTED_FILE_UNRESOLVED": "应命中文档名无法解析到知识库文件",
     "EXPECTED_FILE_AMBIGUOUS": "应命中文档名匹配到多个文件，无法唯一确定",
@@ -341,12 +341,34 @@ def write_eval_case_compare(
         return csv_path
 
 
+def _failure_reason_counts(payload: dict[str, Any]) -> list[tuple[str, int]]:
+    """按中文失败原因汇总（取分号前的主原因）。"""
+    run = payload.get("run") or {}
+    try:
+        run_id = int(run.get("id") or 0)
+    except (TypeError, ValueError):
+        run_id = 0
+    rows = build_eval_case_compare_rows(
+        list(payload.get("cases") or []),
+        list(payload.get("results") or []),
+        run_id=run_id,
+    )
+    counts: Counter[str] = Counter()
+    for row in rows:
+        if str(row.get("判定结果") or "") != "错误":
+            continue
+        reason = str(row.get("失败原因") or "").split("；", 1)[0].strip() or "未分类失败"
+        counts[reason] += 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
 def _eval_run_report_markdown(payload: dict[str, Any]) -> str:
     run = payload.get("run") or {}
     params = run.get("params") or {}
     summary = run.get("summary") or {}
     attrs = summary.get("attribution_counts") or {}
     attr_text = ", ".join(f"{k}:{v}" for k, v in sorted(attrs.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:8]) or "-"
+    reason_counts = _failure_reason_counts(payload)
     lines = [
         f"# Eval RUN {run.get('id')}",
         "",
@@ -369,15 +391,25 @@ def _eval_run_report_markdown(payload: dict[str, Any]) -> str:
         f"- OK count: {summary.get('ok_count')}",
         f"- Top attribution: {attr_text}",
         "",
-        "## Failed Cases",
+        "## 失败原因",
         "",
     ]
+    if reason_counts:
+        for reason, count in reason_counts:
+            lines.append(f"- {reason}: {count}")
+    else:
+        lines.append("- 无失败样本。")
+    lines.extend(["", "## Failed Cases", ""])
     for item in payload.get("results") or []:
         if str(item.get("error_type") or "") == "OK":
             continue
         diag = item.get("diagnostics") or {}
+        ecd = diag.get("eval_case_diagnostics") or {}
+        if not isinstance(ecd, dict):
+            ecd = {}
+        reason = _failure_reason(item, ecd) or "-"
         lines.append(
-            f"- Case {item.get('case_id')}: {item.get('error_type')} / "
+            f"- Case {item.get('case_id')}: {reason} / {item.get('error_type')} / "
             f"{diag.get('retrieval_attribution') or '-'} / QA#{item.get('qa_id')} / {item.get('question')}"
         )
     if lines[-1] == "":
@@ -386,6 +418,8 @@ def _eval_run_report_markdown(payload: dict[str, Any]) -> str:
 
 
 def ollama_health_snapshot(base_url: str, *, timeout_s: float = 3.0) -> dict[str, Any]:
+    import httpx
+
     base = str(base_url or "http://127.0.0.1:11434").rstrip("/")
     started = time.perf_counter()
     out: dict[str, Any] = {"base_url": base, "ok": False, "latency_ms": None, "models": [], "error": ""}

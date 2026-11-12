@@ -33,7 +33,14 @@ class ExperimentStore:
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        # 评测会连续写 qa_log / eval_case_results，默认 5 秒锁等待容易 database is locked。
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
+        return conn
 
     def _init(self) -> None:
         with self._connect() as conn:
@@ -167,19 +174,30 @@ class ExperimentStore:
             conn.commit()
 
     def get_latest_upload_time_for_filename(self, filename: str) -> str | None:
-        """upload_log 中与该 basename 匹配的最新一条上传时间（ISO）。"""
+        """upload_log 中与该 basename 精确匹配的最新一条上传时间（ISO）。
+
+        ``LIKE %name`` 会把「报告.pdf」匹配到「年度报告.pdf」。先用 LIKE 缩小范围，
+        再按文件名本身过滤。
+        """
         fn = Path(filename).name
+        if not fn:
+            return None
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT created_at FROM upload_log
+                SELECT created_at, original_name, saved_path FROM upload_log
                 WHERE original_name = ? OR saved_path LIKE ?
-                ORDER BY created_at DESC LIMIT 1
+                ORDER BY created_at DESC
                 """,
                 (fn, f"%{fn}"),
-            ).fetchone()
-        return str(row["created_at"]) if row else None
+            ).fetchall()
+        for row in rows:
+            original = str(row["original_name"] or "")
+            saved_name = Path(str(row["saved_path"] or "")).name
+            if original == fn or saved_name == fn:
+                return str(row["created_at"])
+        return None
 
     def insert_qa(
         self,

@@ -111,7 +111,7 @@ RAG-Lite 是一个本地轻量化 RAG 验证平台，用于在业务私有文档
 | FR-4.3 | 完整 LLM 评测 | 已实现。执行检索、生成、命中判断和结果保存。 |
 | FR-4.4 | Retrieval-only 评测 | 已实现。跳过 LLM；answer/abstain 不计分，只评估召回与上下文命中。 |
 | FR-4.5 | 命中率指标 | 已实现。candidate/context/chunk + all-labeled 分母；Full LLM 才汇总 answer/abstain。 |
-| FR-4.6 | 错误类型 | 已实现。包含 expected file unresolved、target file miss、chunk miss、rerank drop、abstain miss 等。 |
+| FR-4.6 | 错误类型 | 已实现。包含 expected file unresolved、target file miss、chunk miss、rerank/topk drop、answer_top_k 裁剪（`ANSWER_TOPK_DROP`）、上下文长度预算、abstain miss 等。 |
 | FR-4.7 | 错误归因 | 已实现。基于 diagnostics 和 error_type 生成 attribution。 |
 | FR-4.8 | 按 tag / file / error 汇总 | 已实现。评测面板展示多维汇总。 |
 | FR-4.9 | RUN 参数快照 | 已实现。切片以索引 manifest 为准；记录模型、检索、query anchoring、降级标记等。 |
@@ -225,7 +225,7 @@ Windows 下若项目路径含非 ASCII 字符，`chroma_dir` 会自动重定向�
 
 - 参数网格增加最佳配置推荐文案（排序已实现）。
 - Chunk 诊断增加自动失败解释。
-- Eval RUN 报告增加 baseline delta 和 top failure case。
+- Eval RUN 报告的 baseline 数值差（中文失败原因已进 Markdown，见第 8 节）。
 - 增加更细的 per-case 导出。
 
 ### P2
@@ -237,3 +237,16 @@ Windows 下若项目路径含非 ASCII 字符，`chroma_dir` 会自动重定向�
   - `rag_lite/ui_chat.py`
 - 为 alias、chunk diagnostics、retrieval funnel、baseline compare、param grid 增加单元测试。
 - 增加文档截图或最小使用教程。
+
+## 8. 本阶段延后
+
+下面这些有意停在这一阶段，原因各写一行：
+
+- 继续拆 `main.py` 的对话/评测 UI：行为口径刚对齐，大搬迁会把这次的选择/分数修复淹没掉。
+- 参数网格「最佳配置」推荐文案：排序已经有了，推荐句需要业务阈值，不适合在没有新一轮标注跑分时写死。
+- 评测报告里的 baseline 数值差：Markdown 已有中文失败原因；和哪一次 baseline 比，要跟导出按钮的数据集选择绑在一起，留到下一轮。
+- 别名解析、检索漏斗的单测：逻辑还在 `main.py`，导入会拉起 Gradio 和本机数据目录。
+- 调整 BM25 停用词或把关键词索引落到磁盘：会改变召回，必须用本地 Ollama 和金融验证集重跑，不能只靠离线单测拍板。
+- OCR / 视觉构建加速：默认关闭，这台环境也没有 Tesseract/GPU 可对照。
+- 使用截图或逐步教程：没有可交互的本机 UI 可录。
+- 权限、审计、脱敏导出：PRD 非目标，不做。

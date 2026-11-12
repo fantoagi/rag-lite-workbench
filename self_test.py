@@ -59,8 +59,8 @@ def check_gradio_meta() -> tuple[str | None, int | None]:
     _ok(f"gradio {v} (major={major})")
     if major is not None and major >= 6:
         _warn(
-            "Gradio 6+ is slow to import; suggest: "
-            'pip install "gradio>=4.44.0,<5.0.0" --force-reinstall'
+            "Gradio 6+ 导入很慢；本项目锁定 gradio==5.50.0（见 requirements.txt），"
+            "不要降回 Gradio 4。"
         )
     return v, major
 
@@ -74,7 +74,7 @@ def check_gradio_import() -> bool:
         dt = time.perf_counter() - t0
         _ok(f"import ok in {dt:.1f}s")
         if dt > 30:
-            _warn("very slow; likely Gradio 6.x or cold cache ?? pin Gradio 4.x per README")
+            _warn("import 很慢；若是 Gradio 6.x，请按 requirements.txt 装回 gradio==5.50.0")
         return True
     except Exception as e:
         _fail(f"import failed: {e}")
@@ -173,8 +173,8 @@ def main() -> int:
     print("\n=== summary ===", flush=True)
     if g_import_ok and cfg_ok:
         print("  Core checks passed. If main.py hangs, note the last log line:", flush=True)
-        print("  - stuck at pip: network / torch download; or pre-install gradio 4.x only", flush=True)
-        print("  - stuck at import gradio: still on Gradio 6.x", flush=True)
+        print("  - stuck at pip: network / torch download; pin gradio==5.50.0 from requirements.txt", flush=True)
+        print("  - stuck at import gradio: still on Gradio 6.x, reinstall 5.50.0", flush=True)
         print("  - stuck at launch: port in use / firewall", flush=True)
         return 0
     print("  Fix failures above before running main.py.", flush=True)

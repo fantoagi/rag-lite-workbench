@@ -77,6 +77,16 @@ def test_text_match_loose_near_containment_in_long_chunk():
     assert text_match_loose(expect, actual) is True
 
 
+def test_texts_match_expected_chunk_short_parts_are_not_automatic_hits():
+    # 以前所有子片段都短于 12 字时循环直接 return True，无关文本也算 chunk 命中。
+    assert texts_match_expected_chunk("甲...乙", ["这段文字和金标完全无关，只是占位避免空串。"]) is False
+
+
+def test_texts_match_expected_chunk_skips_short_fragment_when_long_part_hits():
+    long_part = "扩大的价值形式虽然相对于简单的偶然的价值形式有了进一步的发展"
+    assert texts_match_expected_chunk(f"甲...{long_part}", [long_part]) is True
+
+
 def test_texts_match_expected_chunk_multipart_and_joined():
     part_a = "扩大的价值形式虽然相对于简单的偶然的价值形式有了进一步的发展"
     part_b = "扩大的价值形式的缺点是商品价值未能获得共同的统一的表现形式"
@@ -248,6 +258,57 @@ def test_judge_case_abstain_when_has_target_context():
     )
     assert result["error_type"] == "ABSTAIN_WHEN_HAS_TARGET_CONTEXT"
     assert result["abstain_with_target_context"] is True
+
+
+def test_judge_case_answer_topk_drop_is_not_char_budget():
+    case = {
+        "question": "招商证券总部在哪里？",
+        "expected_file_names": ["招商证券年报.pdf"],
+        "expected_chunk_content": "招商证券总部位于深圳",
+    }
+    ranked = [
+        {"file_name": "其他.pdf", "chunk": "无关内容"},
+        {"file_name": "招商证券年报.pdf", "chunk": "招商证券总部位于深圳"},
+    ]
+    sources = [{"file_name": "其他.pdf", "chunk": "无关内容"}]
+    result = judge_case(
+        case,
+        ranked,
+        sources,
+        "不知道。",
+        final_ranked_sources=ranked,
+        context_truncated=True,
+        answer_top_k=1,
+        expected_file_info=_resolved(["招商证券年报.pdf"]),
+    )
+    assert result["error_type"] == "ANSWER_TOPK_DROP"
+    assert result["answer_topk_drop"] is True
+    assert result["context_budget_drop"] is False
+
+
+def test_judge_case_char_budget_when_target_is_inside_answer_top_k():
+    case = {
+        "question": "招商证券总部在哪里？",
+        "expected_file_names": ["招商证券年报.pdf"],
+        "expected_chunk_content": "招商证券总部位于深圳",
+    }
+    ranked = [
+        {"file_name": "招商证券年报.pdf", "chunk": "招商证券总部位于深圳"},
+        {"file_name": "其他.pdf", "chunk": "无关内容"},
+    ]
+    sources = [{"file_name": "其他.pdf", "chunk": "无关内容"}]
+    result = judge_case(
+        case,
+        ranked,
+        sources,
+        "不知道。",
+        final_ranked_sources=ranked,
+        context_truncated=True,
+        answer_top_k=4,
+        expected_file_info=_resolved(["招商证券年报.pdf"]),
+    )
+    assert result["error_type"] == "CONTEXT_BUDGET_DROP"
+    assert result["answer_topk_drop"] is False
 
 
 def test_judge_case_rerank_drop():
