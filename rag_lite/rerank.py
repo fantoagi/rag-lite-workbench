@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from rag_lite.diagnostics import apply_rerank_metadata
+
 if TYPE_CHECKING:
     from llama_index.core.schema import NodeWithScore
 
@@ -50,13 +52,10 @@ def rerank_nodes(
     ranked = sorted(zip(logits, nodes), key=lambda x: float(x[0]), reverse=True)
     out: list[NodeWithScore] = []
     for logit, nws in ranked[:top_k]:
-        vec_score = nws.score
         prob = float(_logits_to_relevance_prob(np.array([logit], dtype=np.float64))[0])
-        # 供界面与 node_to_source_dict 对比展示：重排前的向量检索分
-        md = dict(nws.node.metadata or {})
-        if vec_score is not None:
-            md["rag_vector_score"] = float(vec_score)
-        nws.node.metadata = md
+        # hybrid 合并后 nws.score 是 RRF，不能写进 rag_vector_score。
+        pre = None if nws.score is None else float(nws.score)
+        nws.node.metadata = apply_rerank_metadata(nws.node.metadata, pre, prob)
         nws.score = prob
         out.append(nws)
     return out

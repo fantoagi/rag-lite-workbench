@@ -155,6 +155,12 @@ def attribution_code(
         return "ABSTAIN_POLICY_MISS"
     if err == "ABSTAIN_WHEN_HAS_TARGET_CONTEXT":
         return "OVER_ABSTAIN_WITH_TARGET"
+    # 这两类是「已经召回到 Top-K，但没送进模型」。诊断里若漏了 merged 列表，
+    # 不能再落成 NO_RETRIEVAL_CANDIDATES。
+    if err == "ANSWER_TOPK_DROP":
+        return "ANSWER_TOPK_DROPPED_TARGET"
+    if err == "CONTEXT_BUDGET_DROP":
+        return "CONTEXT_BUDGET_DROPPED_TARGET"
     if not merged_candidates:
         return "NO_RETRIEVAL_CANDIDATES"
     if err == "TARGET_FILE_MISS":
@@ -169,8 +175,6 @@ def attribution_code(
         return "TOPK_DROPPED_TARGET"
     if err == "RERANK_DROP":
         return "TOPK_OR_RERANK_DROPPED_TARGET"
-    if err == "CONTEXT_BUDGET_DROP":
-        return "CONTEXT_BUDGET_DROPPED_TARGET"
     if err == "CONTEXT_MISS":
         return "CONTEXT_SELECTION_MISS"
     if err == "TARGET_FILE_HIT_BUT_CHUNK_MISS":

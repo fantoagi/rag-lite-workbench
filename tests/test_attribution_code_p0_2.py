@@ -41,6 +41,14 @@ def test_abstain_when_has_target_context_via_judge_dict():
     assert out == "OVER_ABSTAIN_WITH_TARGET", out
 
 
+def test_answer_topk_drop_has_its_own_bucket():
+    out = eval_platform.attribution_code(
+        diagnostics={"final_sources": [{"file_name": "其他.pdf"}]},
+        error_type="ANSWER_TOPK_DROP",
+    )
+    assert out == "ANSWER_TOPK_DROPPED_TARGET", out
+
+
 def test_answered_when_should_abstain_still_uses_policy_bucket():
     # The pre-existing branch must keep working; we only added a new branch
     # and must not regress the symmetric ANSWERED_WHEN_SHOULD_ABSTAIN case.

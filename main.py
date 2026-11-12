@@ -400,6 +400,8 @@ print(
 )
 
 from rag_lite.config import load_config
+from rag_lite.diagnostics import format_diag_score, score_kind_label
+from rag_lite.kb_files import disk_index_for_kb_table_row, kb_status_rows
 from rag_lite.ingest import (
     _filename_equiv,
     active_chroma_label,
@@ -792,14 +794,7 @@ def kb_files_table_value(embed_selected: str) -> list[list[str]]:
     manifest = store.get_index_manifest()
     disk = uploaded_files_snapshot(cfg)
     index_state = _build_index_status_snapshot()
-    status_rows = [
-        ["[索引状态] build_id", str(index_state.get("manifest_build_id") or "—"), "—", "—", "—"],
-        ["[索引状态] active一致", "是" if index_state.get("active_dir_matches_manifest") else "否", "—", "—", "—"],
-        ["[索引状态] readiness", "通过" if index_state.get("readiness_ok") else "未通过", "—", "—", "—"],
-        ["[索引状态] uploads变化", "是" if index_state.get("uploads_changed_since_manifest") else "否", "—", "—", "—"],
-        ["[索引状态] diagnostics", f"{int(index_state.get('diagnostics_total_files') or 0)} 文件 / {int(index_state.get('diagnostics_total_chunks') or 0)} 切片", "—", "—", "—"],
-        ["[索引状态] 缺失上传文件", str(int(index_state.get("missing_uploaded_files_count") or 0)), "—", "—", "—"],
-    ]
+    status_rows = kb_status_rows(index_state)
     if not disk:
         return status_rows + [["（暂无文件）", "—", "—", "—", "—"]]
     mf_files: dict[str, dict] = {}
@@ -1082,7 +1077,7 @@ _KB_SECTION_UPLOADED_HTML = """
 <input type="checkbox" id="rag-tip-cb-kb-files" class="rag-tip-cb" tabindex="-1" aria-hidden="true"/>
 <label for="rag-tip-cb-kb-files" class="rag-tip-trigger rag-tip-trigger--h5" title="表格说明">!</label>
 <div id="rag-tip-pop-kb-files" class="rag-tip-pop">
-<div class="rag-tip-block rag-tip-block--tight rag-tip-block--in-pop">点击表格<strong>任一格</strong>选中整行，再点下方按钮从上传目录删除。</div>
+<div class="rag-tip-block rag-tip-block--tight rag-tip-block--in-pop">顶部几行是索引状态，不能删。点击某个<strong>文件名</strong>那一行，再点「移除选中文件」或「预览切片」。</div>
 </div>
 </div>
 </div>
@@ -1206,16 +1201,16 @@ def _sources_panel_html(sources: list) -> str:
     def _score_badge_class(kind: str) -> str:
         if kind == "rerank":
             return "#e8f5e9"
+        if kind in {"keyword", "keyword_fallback"}:
+            return "#fff7ed"
+        if kind == "hybrid":
+            return "#eef2ff"
         return "#e3f2fd"
 
     cards: list[str] = []
     for i, s in enumerate(sources, 1):
-        kind_key = s.get("score_kind") or ""
-        kind_label = (
-            "Cross-Encoder 重排（相关性 0–1）"
-            if kind_key == "rerank"
-            else "向量检索得分"
-        )
+        kind_key = str(s.get("score_kind") or "")
+        kind_label = score_kind_label(kind_key)
         score = s.get("score")
         score_s = f"{score:.4f}" if score is not None else "—"
         vec_sc = s.get("vector_score")
@@ -1227,16 +1222,35 @@ def _sources_panel_html(sources: list) -> str:
         preview_esc = html.escape(preview_plain)
         badge_bg = _score_badge_class(kind_key)
         dlg_id = f"rag-src-dlg-{i}"
+        kw_sc = s.get("keyword_score")
+        kw_s = f"{kw_sc:.4f}" if isinstance(kw_sc, (int, float)) else None
+        prior_bits: list[str] = []
         if kind_key == "rerank" and vec_s is not None:
-            score_line = (
+            prior_bits.append(
                 f'<span style="background:#e3f2fd;padding:2px 10px;border-radius:999px;'
                 f'font-size:0.8em;border:1px solid rgba(0,0,0,0.06);white-space:nowrap;">'
                 f"向量检索：<strong>{html.escape(vec_s)}</strong></span>"
-                f'<span style="background:{badge_bg};padding:2px 10px;border-radius:999px;'
+            )
+        if kind_key == "rerank" and kw_s is not None:
+            prior_bits.append(
+                f'<span style="background:#fff7ed;padding:2px 10px;border-radius:999px;'
+                f'font-size:0.8em;border:1px solid rgba(0,0,0,0.06);white-space:nowrap;">'
+                f"关键词：<strong>{html.escape(kw_s)}</strong></span>"
+            )
+        if prior_bits:
+            score_line = (
+                "".join(prior_bits)
+                + f'<span style="background:{badge_bg};padding:2px 10px;border-radius:999px;'
                 f'font-size:0.8em;border:1px solid rgba(0,0,0,0.06);white-space:nowrap;">'
                 f"{html.escape(kind_label)}：<strong>{html.escape(score_s)}</strong></span>"
             )
-            dlg_scores = f"向量检索：{html.escape(vec_s)}　{html.escape(kind_label)}：{html.escape(score_s)}"
+            dlg_parts = []
+            if vec_s is not None:
+                dlg_parts.append(f"向量检索：{html.escape(vec_s)}")
+            if kw_s is not None:
+                dlg_parts.append(f"关键词：{html.escape(kw_s)}")
+            dlg_parts.append(f"{html.escape(kind_label)}：{html.escape(score_s)}")
+            dlg_scores = "　".join(dlg_parts)
         else:
             score_line = (
                 f'<span style="background:{badge_bg};padding:2px 10px;border-radius:999px;'
@@ -1384,27 +1398,30 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
         f' <strong>Includes zero-chunk:</strong>{"yes" if diag.get("include_zero_chunk") else "no"}</p>'
         f"</div>"
     )
+    verr = str(diag.get("vector_error") or "").strip()
+    degraded = bool(diag.get("retrieval_degraded")) or (
+        bool(verr) and "skipped" not in verr.lower()
+    )
+    if degraded:
+        summary += (
+            "<p style='margin:0.35em 0 0 0;color:#92400e;'><strong>向量检索降级：</strong>"
+            f"{html.escape(verr or 'keyword_fallback')}。本轮分数若未标为 rerank，则来自关键词召回。</p>"
+        )
 
-    def _table(title: str, rows: list[dict[str, Any]], show_vector: bool) -> str:
+    def _table(title: str, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return f'<p style="margin:0 0 8px 0;color:#64748b;">{html.escape(title)}：无数据。</p>'
         body: list[str] = []
         for row in rows:
             rank = int(row.get("rank") or 0)
             fname = html.escape(str(row.get("file_name") or "unknown"))
-            score = row.get("score")
-            score_s = "—" if score is None else f"{float(score):.4f}"
-            extras = ""
-            if show_vector:
-                vec = row.get("vector_score")
-                vec_s = "—" if vec is None else f"{float(vec):.4f}"
-                extras = f" / 向量 {vec_s}"
+            score_cell = html.escape(format_diag_score(row))
             preview = html.escape(str(row.get("preview") or ""))
             body.append(
                 "<tr>"
                 f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{rank}</td>"
                 f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{fname}</td>"
-                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;white-space:nowrap;'>{score_s}{extras}</td>"
+                f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;white-space:nowrap;'>{score_cell}</td>"
                 f"<td style='padding:6px 8px;border-top:1px solid #e5e7eb;'>{preview}</td>"
                 "</tr>"
             )
@@ -1427,10 +1444,10 @@ def _retrieval_diag_html(diag: dict[str, Any] | None) -> str:
         final_title += " (after rerank)"
     return (
         summary
-        + _table("Vector Top-N candidates", cand, show_vector=True)
-        + _table("Keyword/BM25 Top-N candidates", keyword, show_vector=True)
-        + _table("Merged candidates", merged, show_vector=True)
-        + _table(final_title, finals, show_vector=True)
+        + _table("Vector Top-N candidates", cand)
+        + _table("Keyword/BM25 Top-N candidates", keyword)
+        + _table("Merged candidates", merged)
+        + _table(final_title, finals)
     )
 
 def _chunk_diag_summary_html(diag: dict[str, Any]) -> str:
@@ -1696,10 +1713,18 @@ def do_chat_stream(
         merged_diag = eng.nodes_to_source_dicts(retrieval_result.merged_nodes, "hybrid")
         excluded_candidate_count = retrieval_result.excluded_candidate_count
         line1 = (
-            f"**Hybrid retrieval complete** (vector {len(retrieval_result.vector_nodes)} / "
-            f"keyword {len(retrieval_result.keyword_nodes)} / merged {len(retrieval_result.merged_nodes)} / "
-            f"excluded {excluded_candidate_count} / Top-{top_n})"
+            f"**混合检索完成**（向量 {len(retrieval_result.vector_nodes)} / "
+            f"关键词 {len(retrieval_result.keyword_nodes)} / 合并 {len(retrieval_result.merged_nodes)} / "
+            f"已排除 {excluded_candidate_count} / Top-{top_n}）"
         )
+        if retrieval_result.retrieval_degraded:
+            verr = str(retrieval_result.vector_error or "").strip()
+            line1 += (
+                "\n\n**向量检索失败，本轮已降级为关键词召回。**"
+                "回答不代表向量库可用，请检查 Ollama embedding。"
+            )
+            if verr:
+                line1 += f"\n\n`{verr}`"
         new_hist[-1]["content"] = line1
         yield _chatbot_value(new_hist), _sources_panel_html([]), _retrieval_diag_html(
             _retrieval_diag_payload(
@@ -1720,7 +1745,7 @@ def do_chat_stream(
         ), _out_msg()
 
         nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
-        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+        nodes_for_answer, context_truncated, answer_topk_capped = eng.select_nodes_for_answer(
             cfg,
             qtext,
             nodes,
@@ -1746,7 +1771,9 @@ def do_chat_stream(
         )
         diag_payload["context_selected_count"] = len(nodes_for_answer)
         diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["answer_topk_capped"] = bool(answer_topk_capped)
         diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
+        diag_payload["retrieval_degraded"] = bool(retrieval_result.retrieval_degraded)
         diag_payload["index_state"] = dict(index_state)
         diag_payload["index_state_summary"] = index_summary
         diag_html = _retrieval_diag_html(diag_payload)
@@ -1818,17 +1845,17 @@ def do_chat_stream(
             yield _chatbot_value(new_hist), src_html, diag_html, _out_msg()
             return
 
-        kind_zh = "重排" if kind == "rerank" else "向量截断"
-        if bool(use_rerank) and retrieval_result.merged_nodes:
+        if kind == "rerank" and retrieval_result.merged_nodes:
             progress_head = (
                 f"{line1}\n\n"
-                f"**② 重排完成**（{kind_zh}，送入上下文 {len(nodes_for_answer)} 条）\n\n"
+                f"**② 重排完成**（送入上下文 {len(nodes_for_answer)} 条）\n\n"
                 f"**③ 正在生成回答…**"
             )
         else:
+            note = "向量失败，关键词降级" if retrieval_result.retrieval_degraded else "未启用重排"
             progress_head = (
                 f"{line1}\n\n"
-                f"**③ 正在生成回答…**（未启用重排，送入上下文 {len(nodes_for_answer)} 条）"
+                f"**③ 正在生成回答…**（{note}，送入上下文 {len(nodes_for_answer)} 条）"
             )
         sep = "\n\n---\n\n"
         new_hist[-1]["content"] = progress_head + sep
@@ -2472,7 +2499,7 @@ def do_batch_replay(
         merged_diag = eng.nodes_to_source_dicts(retrieval_result.merged_nodes, "hybrid")
         excluded_candidate_count = retrieval_result.excluded_candidate_count
         nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
-        nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+        nodes_for_answer, context_truncated, answer_topk_capped = eng.select_nodes_for_answer(
             cfg,
             qtext,
             nodes,
@@ -2498,6 +2525,7 @@ def do_batch_replay(
         )
         diag_payload["context_selected_count"] = len(nodes_for_answer)
         diag_payload["context_truncated"] = bool(context_truncated)
+        diag_payload["answer_topk_capped"] = bool(answer_topk_capped)
         diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
         diag_payload["index_state"] = dict(index_state)
         diag_payload["index_state_summary"] = _index_state_summary_text(index_state)
@@ -2563,6 +2591,8 @@ def do_batch_replay(
                 qa_id,
             ]
         )
+        if retrieval_result.retrieval_degraded:
+            lines.append("    警告：向量检索失败，本条已降级为关键词召回。")
         lines.append(
             f"    Hybrid candidates {len(retrieval_result.merged_nodes)} "
             f"(vector {len(retrieval_result.vector_nodes)} / keyword {len(retrieval_result.keyword_nodes)}), "
@@ -3130,11 +3160,6 @@ def _chunk_match_diagnostics(
     return eval_judge.chunk_match_diagnostics(expected_chunk, candidates, sources)
 
 
-
-    s = str(answer or "")
-    return ("无法回答" in s) or ("未检索到任何文档片段" in s)
-
-
 def _evaluate_case_result(
     case: dict[str, Any],
     vector_diag: list[dict[str, Any]],
@@ -3146,6 +3171,7 @@ def _evaluate_case_result(
     context_truncated: bool = False,
     generation_mode: str | None = None,
     no_context: bool | None = None,
+    answer_top_k: int | None = None,
 ) -> dict[str, Any]:
     expected_raw_files = [str(x).strip() for x in (case.get("expected_file_names") or []) if str(x).strip()]
     expected_info = _resolve_expected_eval_file_details(expected_raw_files)
@@ -3160,6 +3186,7 @@ def _evaluate_case_result(
         expected_file_info=expected_info,
         generation_mode=generation_mode,
         no_context=no_context,
+        answer_top_k=answer_top_k,
     )
 
 
@@ -4235,7 +4262,7 @@ def do_run_eval_dataset(
             excluded_candidate_count = retrieval_result.excluded_candidate_count
             nodes, kind = retrieval_result.final_nodes, retrieval_result.score_kind
             final_ranked_sources = eng.nodes_to_source_dicts(nodes, kind)
-            nodes_for_answer, context_truncated = eng.select_nodes_for_answer(
+            nodes_for_answer, context_truncated, answer_topk_capped = eng.select_nodes_for_answer(
                 cfg,
                 qtext,
                 nodes,
@@ -4265,6 +4292,7 @@ def do_run_eval_dataset(
             diag_payload["final_ranked_contexts"] = final_ranked_sources
             diag_payload["context_selected_count"] = len(nodes_for_answer)
             diag_payload["context_truncated"] = bool(context_truncated)
+            diag_payload["answer_topk_capped"] = bool(answer_topk_capped)
             diag_payload["vector_error"] = str(retrieval_result.vector_error or "")
             diag_payload["retrieval_degraded"] = bool(retrieval_result.retrieval_degraded)
             diag_payload["requested_retrieval_mode"] = str(
@@ -4286,6 +4314,10 @@ def do_run_eval_dataset(
                 ):
                     parts.append(token)
                 answer = "".join(parts).strip() or "（模型未返回正文）"
+            try:
+                answer_top_k = int((cfg.retrieval or {}).get("answer_top_k") or 0)
+            except (TypeError, ValueError):
+                answer_top_k = 0
             judge = _evaluate_case_result(
                 case,
                 merged_diag,
@@ -4296,6 +4328,7 @@ def do_run_eval_dataset(
                 context_truncated=bool(context_truncated),
                 generation_mode=generation_mode,
                 no_context=no_context,
+                answer_top_k=answer_top_k,
             )
             diag_payload["eval_case_diagnostics"] = {
                 "issue_codes": list(judge.get("issue_codes") or []),
@@ -4306,6 +4339,7 @@ def do_run_eval_dataset(
                 "final_ranked_hit": judge.get("final_ranked_hit"),
                 "topk_or_rerank_drop": bool(judge.get("topk_or_rerank_drop")),
                 "context_budget_drop": bool(judge.get("context_budget_drop")),
+                "answer_topk_drop": bool(judge.get("answer_topk_drop")),
                 "target_file_hit_but_chunk_miss": bool(judge.get("target_file_hit_but_chunk_miss")),
                 "candidate_hit": judge.get("candidate_hit"),
                 "context_hit": judge.get("context_hit"),
@@ -5188,35 +5222,25 @@ def build_ui():
         return [], sid, gr.update(value=_sessions_table_value())
 
     def _on_kb_file_select(evt: gr.SelectData):
-        """只存表格行号；预览/删除时用当前磁盘快照解析真实文件名，避免与向量库元数据字符串不一致。"""
+        """存上传快照下标。表格顶部是索引状态行，不能把 Gradio 行号当成文件下标。"""
         disk = uploaded_files_snapshot(cfg)
         if not getattr(evt, "selected", False) or not disk:
             return None
         idx = evt.index
         r0: int | None = None
-        r1: int | None = None
         if isinstance(idx, (list, tuple)) and len(idx) >= 1:
-            r0 = int(idx[0])
-            r1 = int(idx[1]) if len(idx) >= 2 else None
+            try:
+                r0 = int(idx[0])
+            except (TypeError, ValueError):
+                r0 = None
         else:
-            r0 = int(idx)
-        if r0 is not None and 0 <= r0 < len(disk):
-            return r0
-        if r1 is not None and 0 <= r1 < len(disk):
-            return r1
+            try:
+                r0 = int(idx)
+            except (TypeError, ValueError):
+                r0 = None
         rv = getattr(evt, "row_value", None)
-        if rv is not None:
-            cells = list(rv) if isinstance(rv, (list, tuple)) else [rv]
-            if cells:
-                s0 = str(cells[0]).strip()
-                if s0.startswith("（暂无"):
-                    return None
-                guess = _canonical_upload_filename(s0, disk)
-                if guess:
-                    for i, f in enumerate(disk):
-                        if f["name"] == guess:
-                            return i
-        return None
+        cells = list(rv) if isinstance(rv, (list, tuple)) else None
+        return disk_index_for_kb_table_row(r0, cells, [str(f["name"]) for f in disk])
 
     with gr.Blocks(
         title="RAG 验证工作台",

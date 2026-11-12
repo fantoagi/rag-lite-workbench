@@ -15,6 +15,8 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 
 from rag_lite.config import AppConfig
+from rag_lite.context_budget import select_for_llm_context
+from rag_lite.diagnostics import resolve_retrieval_score_kind
 from rag_lite.ingest import chunk_diagnostics, load_index_from_disk, resolve_active_chroma_dir, uploaded_files_snapshot
 from rag_lite.eval_platform import attach_run_fingerprint
 from rag_lite.retrieval import (
@@ -225,47 +227,30 @@ def select_nodes_for_answer(
     *,
     llm_model: str | None = None,
     llm_num_ctx: int | None = None,
-) -> tuple[list, bool]:
+) -> tuple[list, bool, bool]:
     """
     选择实际喂给 LLM 的节点：先按 answer_top_k（生成侧上限）截断，
     再按 max_llm_context_chars 做字符预算，避免引用展示与模型所见不一致。
-    返回 (selected_nodes, truncated)。
+    返回 (selected_nodes, char_truncated, capped_by_answer_top_k)。
+    char_truncated 只表示字符预算截断，不再把 answer_top_k 裁剪算进去。
     """
-    nodes_list = list(nodes or [])
-    if not nodes_list:
-        return [], False
-    # 生成侧 Top-K：默认可低于检索 top_k，减轻小模型串文档
     try:
         answer_top_k = int((cfg.retrieval or {}).get("answer_top_k") or 0)
     except (TypeError, ValueError):
         answer_top_k = 0
-    capped_by_k = False
-    if answer_top_k > 0 and len(nodes_list) > answer_top_k:
-        nodes_list = nodes_list[:answer_top_k]
-        capped_by_k = True
     o = dict(cfg.ollama)
     if llm_model:
         o["llm_model"] = llm_model
     if llm_num_ctx is not None:
         o["num_ctx"] = int(llm_num_ctx)
     max_c = int(o.get("max_llm_context_chars", 100_000))
-    q = str(query or "").strip()
-    fixed_len = len("【已知上下文】\n") + len("\n\n【用户问题】\n") + len(q)
-    budget = max_c - fixed_len
-    if budget <= 0:
-        return [], True
-    selected: list = []
-    used = 0
-    sep_len = len("\n\n---\n\n")
-    for nws in nodes_list:
-        part = _node_context_part(nws, len(selected) + 1)
-        add = len(part) + (sep_len if selected else 0)
-        if used + add > budget:
-            break
-        selected.append(nws)
-        used += add
-    truncated = capped_by_k or (len(selected) < len(nodes or []))
-    return selected, truncated
+    return select_for_llm_context(
+        list(nodes or []),
+        lambda nws, idx: _node_context_part(nws, idx),
+        query=query,
+        max_context_chars=max_c,
+        answer_top_k=answer_top_k,
+    )
 
 
 def filter_nodes_by_excluded_files(nodes: list, excluded_files: list[str] | tuple[str, ...] | None) -> tuple[list, int]:
@@ -469,14 +454,15 @@ def hybrid_retrieve(
         and str(vector_error or "").strip()
         and "skipped" not in str(vector_error or "").lower()
     )
-    # 向量阶段失败时不得继续标成 hybrid/rerank，避免伪成功
-    if vector_failed:
-        if keyword_enabled and merged_nodes:
-            kind = "keyword_fallback"
-        else:
-            kind = "vector_error"
-    elif kind == "vector":
-        kind = requested_mode
+    # 向量失败时不得标成 hybrid。重排已经改过顺序时，分数仍是 rerank，
+    # 降级本身记在 retrieval_degraded，避免把概率误标成 BM25。
+    kind = resolve_retrieval_score_kind(
+        vector_failed=vector_failed,
+        keyword_enabled=bool(keyword_enabled),
+        has_final_nodes=bool(final_nodes),
+        rerank_applied=bool(use_rerank) and kind == "rerank" and bool(final_nodes),
+        requested_mode=requested_mode,
+    )
     return RetrievalPipelineResult(
         vector_nodes=vector_nodes,
         keyword_nodes=keyword_nodes,
@@ -498,7 +484,7 @@ def stream_answer(
     llm_model: str | None = None,
     llm_num_ctx: int | None = None,
 ) -> Iterator[str]:
-    selected_nodes, context_truncated = select_nodes_for_answer(
+    selected_nodes, context_truncated, _capped_by_answer_top_k = select_nodes_for_answer(
         cfg,
         query,
         nodes,

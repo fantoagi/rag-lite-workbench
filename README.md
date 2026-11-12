@@ -78,6 +78,8 @@ powershell -ExecutionPolicy Bypass -File setup-venv.ps1
 .\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
+这些单测不连接 Ollama，也不打开向量库，用来锁住检索分数口径、知识库选行、评测归因和 SQLite 写入。
+
 ## 界面结构
 
 应用只有三个顶层页签：
@@ -98,7 +100,9 @@ powershell -ExecutionPolicy Bypass -File setup-venv.ps1
 4. 构建向量索引。
 5. 查看文件状态、切片预览、切片统计和索引运维诊断。
 
-切分策略支持 `sentence` / `token` / `paragraph`。界面默认选中 **paragraph**（段落优先）；代码在未传入策略时回退为 `sentence`。
+切分策略支持 `sentence` / `token` / `paragraph`。界面和 `config.yaml` 的默认都是 **sentence**（`chunking.chunk_mode_default`）；代码在完全没传入策略时也回退为 `sentence`。改切片不会改变已经建好的索引，需要重建。
+
+文件表最上面几行是索引状态（build、readiness、uploads 是否变化）。点这些行不会选中文件；删除和切片预览按文件名对应到上传目录，避免把状态行的行号当成第 N 个文件。
 
 索引构建采用“临时目录构建 -> 自检 -> 版本化激活”的方式。新版本通过自检后才会切换到 `{chroma_dir.name}.__versions__/<build_id>`，失败时保留上一个可用版本。
 
@@ -120,7 +124,11 @@ powershell -ExecutionPolicy Bypass -File setup-venv.ps1
 4. 对回答打分或备注。
 5. 导出 QA 日志 JSON / CSV。
 
-对话固定走 hybrid 检索。检索诊断会展示 vector、keyword、merged、final context 等阶段的候选数量、来源、得分和片段摘要。若没有检索到任何上下文，系统不会调用 LLM，会直接给出固定拒答说明。向量阶段失败时会降级为 `keyword_fallback` / `vector_error`，不再伪标为 hybrid。
+对话固定走 hybrid 检索。检索诊断会展示 vector、keyword、merged、final context 等阶段的候选数量、来源、得分和片段摘要。引用卡片上的分数名称和 `score_kind` 一致：向量分、关键词/BM25、混合 RRF、Cross-Encoder 重排。重排不会再把混合 RRF 分写进「向量检索」那一栏。
+
+若没有检索到任何上下文，系统不会调用 LLM，会直接给出固定拒答说明。向量阶段失败时对话里会写明「已降级为关键词召回」，诊断区也会标出 `vector_error`；此时 `score_kind` 为 `keyword_fallback`，若重排已经跑完则仍标 `rerank`（数字是相关性概率，降级看 `retrieval_degraded`）。
+
+生成侧实际送进模型的片段数受 `retrieval.answer_top_k` 限制，可以小于检索 Top-K。评测里如果目标文档进了 Top-K、但被这个上限裁掉，错误类型是 `ANSWER_TOPK_DROP`，不再一律记成上下文长度预算。字符预算截断才是 `CONTEXT_BUDGET_DROP`。
 
 ### 3. 批量回放
 
@@ -152,6 +160,7 @@ powershell -ExecutionPolicy Bypass -File setup-venv.ps1
 评测运行会生成 RUN，并记录：
 
 - candidate / context / chunk hit rate（另有 all-labeled 口径：未解析 expected file 计入分母为未命中）
+- `ANSWER_TOPK_DROP`：目标文档在检索 Top-K 内，但名次超出 `answer_top_k`，没有送进模型
 - answer hit rate / abstain accuracy（仅 Full LLM；retrieval-only 显示为 —）
 - error type / attribution
 - run fingerprint（含 generation_mode、query_anchoring、index 切片）
@@ -221,6 +230,10 @@ data/
 - `data/eval_file_aliases.json`：评测 expected file alias。
 - `data/eval_baselines.json`：评测 baseline RUN。
 - `{chroma_dir.name}.__versions__/`：版本化 Chroma 索引目录。
+
+SQLite 使用 WAL，并加长了锁等待，避免评测连续写入时出现 `database is locked`。知识库「上传时间」按文件名精确匹配，不会把 `报告.pdf` 显示成 `年度报告.pdf` 的时间。
+
+评测 Markdown 报告除了错误码，还会按中文失败原因汇总（例如「未召回到应命中文档」）。逐题对比表仍是 xlsx/csv。
 
 Windows 下若项目路径含非 ASCII 字符（例如中文目录），Chroma 会自动重定向到：
 

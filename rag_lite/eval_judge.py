@@ -286,16 +286,24 @@ def texts_match_expected_chunk(
         if text_match_loose(target, joined, cfg):
             return True
         return any(text_match_loose(target, t, cfg) for t in texts)
-    # 多段金标：每个子片段至少命中某一段或拼接文本
+    # 多段金标：每个足够长的子片段至少命中某一段或拼接文本。
+    # 过短碎片跳过；若因此一个都没核验，退回整段匹配，避免空条件直接判命中。
+    checked = 0
     for part in parts:
         norm = _normalize_for_judge(part)
         if len(norm) < 12:
             continue
+        checked += 1
         if text_match_loose(part, joined, cfg):
             continue
         if any(text_match_loose(part, t, cfg) for t in texts):
             continue
         return False
+    if checked == 0:
+        target = str(expect_text or "")
+        if text_match_loose(target, joined, cfg):
+            return True
+        return any(text_match_loose(target, t, cfg) for t in texts)
     return True
 
 
@@ -385,6 +393,17 @@ def _file_name(item: dict[str, Any]) -> str:
     return str(item.get("file_name") or "").strip()
 
 
+def _first_matching_rank(
+    file_names: list[str],
+    expected_files: set[str],
+    expected_raw_values: list[Any] | None,
+) -> int | None:
+    for i, name in enumerate(file_names, start=1):
+        if _eval_filename_matches_expected(name, expected_files, expected_raw_values):
+            return i
+    return None
+
+
 def _file_list_hits_expected(
     file_names: list[str],
     expected_files: set[str],
@@ -434,6 +453,7 @@ def judge_case(
     expected_file_info: dict[str, Any] | None = None,
     generation_mode: str | None = None,
     no_context: bool | None = None,
+    answer_top_k: int | None = None,
 ) -> dict[str, Any]:
     """主判定函数。
 
@@ -511,7 +531,31 @@ def judge_case(
     non_file_eval = not bool(expected_raw_files)
     filtered_out = bool(candidate_file_list) and not bool(context_file_list) and candidate_hit is True and context_hit is False
     topk_or_rerank_drop = bool(candidate_hit is True and final_ranked_hit is False)
-    context_budget_drop = bool(final_ranked_hit is True and context_hit is False and context_truncated)
+    try:
+        answer_k = int(answer_top_k) if answer_top_k is not None else 0
+    except (TypeError, ValueError):
+        answer_k = 0
+    if answer_k < 0:
+        answer_k = 0
+    target_rank = (
+        _first_matching_rank(final_ranked_list, expected_files, expected_raw_files)
+        if final_ranked_hit is True
+        else None
+    )
+    # 目标文件在检索 Top-K 里，但名次超出生成侧 answer_top_k，根本没进入字符预算
+    answer_topk_drop = bool(
+        answer_k > 0
+        and final_ranked_hit is True
+        and context_hit is False
+        and target_rank is not None
+        and target_rank > answer_k
+    )
+    context_budget_drop = bool(
+        final_ranked_hit is True
+        and context_hit is False
+        and context_truncated
+        and not answer_topk_drop
+    )
     target_file_hit_but_chunk_miss = bool(context_hit is True and expected_chunk and chunk_hit is False)
     has_target_context = bool(expected_files) or bool(expected_chunk) or bool(case.get("expected_answer"))
     # 仅模型输出拒答文案才算 OVER_ABSTAIN；系统 [NO_CONTEXT] 走检索失败口径
@@ -533,6 +577,8 @@ def judge_case(
         issue_codes.append("FILTERED_OUT")
     if topk_or_rerank_drop:
         issue_codes.append("RERANK_DROP" if use_rerank else "TOPK_DROP")
+    if answer_topk_drop:
+        issue_codes.append("ANSWER_TOPK_DROP")
     if context_budget_drop:
         issue_codes.append("CONTEXT_BUDGET_DROP")
     # 空候选时 candidate_hit 为 None；对有可解析期望文件的题目仍视为未命中
@@ -575,6 +621,8 @@ def judge_case(
     elif context_hit is not True and bool(expected_files):
         if context_budget_drop:
             error_type = "CONTEXT_BUDGET_DROP"
+        elif answer_topk_drop:
+            error_type = "ANSWER_TOPK_DROP"
         elif topk_or_rerank_drop:
             error_type = "RERANK_DROP" if use_rerank else "TOPK_DROP"
         else:
@@ -602,6 +650,7 @@ def judge_case(
         "final_ranked_hit": final_ranked_hit,
         "topk_or_rerank_drop": topk_or_rerank_drop,
         "context_budget_drop": context_budget_drop,
+        "answer_topk_drop": answer_topk_drop,
         "target_file_hit_but_chunk_miss": target_file_hit_but_chunk_miss,
         "chunk_diagnostics": chunk_diag,
         "retrieval_only": retrieval_only,
